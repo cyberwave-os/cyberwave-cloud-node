@@ -1,0 +1,11 @@
+# Cyberwave Cloud Node configuration for local testing
+cyberwave-cloud-node:
+  profile_slug: gpu-a100
+  provider: self-hosted
+  server_port: 9000
+  heartbeat_interval: 30
+  
+  # Example commands (uncomment and modify as needed)
+  # install_script: ./install.sh
+  # inference: python inference.py --params {body}
+  # training: python train.py --params {body}
