@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 from . import credentials as creds_module  # noqa: E402
 
-
 # API Configuration
 DEFAULT_API_URL = "https://api.cyberwave.com"
 CLOUD_NODE_REGISTER_ENDPOINT = "/api/v1/cloud-node/register"
@@ -18,15 +17,16 @@ CLOUD_NODE_HEARTBEAT_ENDPOINT = "/api/v1/cloud-node/heartbeat"
 CLOUD_NODE_TERMINATED_ENDPOINT = "/api/v1/cloud-node/terminated"
 CLOUD_NODE_FAILED_ENDPOINT = "/api/v1/cloud-node/failed"
 
+# MQTT Configuration
+DEFAULT_MQTT_HOST = "mqtt.cyberwave.com"
+DEFAULT_MQTT_PORT = 1883
+
 # Default config file name
 CONFIG_FILE_NAME = "cyberwave.yml"
 ENV_FILE_NAME = ".env"
 
 # Heartbeat interval in seconds
 DEFAULT_HEARTBEAT_INTERVAL = 30
-
-# Default server port for receiving workload requests
-DEFAULT_SERVER_PORT = 8080
 
 
 def load_dotenv_files(working_dir: Optional[Path] = None) -> None:
@@ -87,6 +87,26 @@ def get_workspace_slug() -> Optional[str]:
     return creds_module.get_workspace_slug()
 
 
+def get_mqtt_host() -> str:
+    """Get MQTT broker host from environment or default."""
+    return os.getenv("CYBERWAVE_MQTT_HOST", DEFAULT_MQTT_HOST)
+
+
+def get_mqtt_port() -> int:
+    """Get MQTT broker port from environment or default."""
+    return int(os.getenv("CYBERWAVE_MQTT_PORT", str(DEFAULT_MQTT_PORT)))
+
+
+def get_mqtt_username() -> Optional[str]:
+    """Get MQTT username from environment."""
+    return os.getenv("CYBERWAVE_MQTT_USERNAME")
+
+
+def get_mqtt_password() -> Optional[str]:
+    """Get MQTT password from environment."""
+    return os.getenv("CYBERWAVE_MQTT_PASSWORD")
+
+
 @dataclass
 class CloudNodeConfig:
     """Configuration for a Cyberwave Cloud Node.
@@ -99,8 +119,11 @@ class CloudNodeConfig:
     training: Optional[str] = None
     profile_slug: str = "default"
     provider: str = "self-hosted"
-    server_port: int = DEFAULT_SERVER_PORT
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
+    mqtt_host: str = DEFAULT_MQTT_HOST
+    mqtt_port: int = DEFAULT_MQTT_PORT
+    mqtt_username: Optional[str] = None
+    mqtt_password: Optional[str] = None
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -114,10 +137,13 @@ class CloudNodeConfig:
             training=cloud_node_data.get("training"),
             profile_slug=cloud_node_data.get("profile_slug", "default"),
             provider=cloud_node_data.get("provider", "self-hosted"),
-            server_port=cloud_node_data.get("server_port", DEFAULT_SERVER_PORT),
             heartbeat_interval=cloud_node_data.get(
                 "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL
             ),
+            mqtt_host=cloud_node_data.get("mqtt_host", get_mqtt_host()),
+            mqtt_port=cloud_node_data.get("mqtt_port", get_mqtt_port()),
+            mqtt_username=cloud_node_data.get("mqtt_username", get_mqtt_username()),
+            mqtt_password=cloud_node_data.get("mqtt_password", get_mqtt_password()),
             extra={
                 k: v
                 for k, v in cloud_node_data.items()
@@ -128,8 +154,11 @@ class CloudNodeConfig:
                     "training",
                     "profile_slug",
                     "provider",
-                    "server_port",
                     "heartbeat_interval",
+                    "mqtt_host",
+                    "mqtt_port",
+                    "mqtt_username",
+                    "mqtt_password",
                 }
             },
         )
@@ -171,8 +200,11 @@ class CloudNodeConfig:
             training=os.getenv("CYBERWAVE_TRAINING_CMD"),
             profile_slug=os.getenv("CYBERWAVE_PROFILE_SLUG", "default"),
             provider=os.getenv("CYBERWAVE_PROVIDER", "self-hosted"),
-            server_port=int(os.getenv("CYBERWAVE_SERVER_PORT", str(DEFAULT_SERVER_PORT))),
             heartbeat_interval=int(
                 os.getenv("CYBERWAVE_HEARTBEAT_INTERVAL", str(DEFAULT_HEARTBEAT_INTERVAL))
             ),
+            mqtt_host=get_mqtt_host(),
+            mqtt_port=get_mqtt_port(),
+            mqtt_username=get_mqtt_username(),
+            mqtt_password=get_mqtt_password(),
         )

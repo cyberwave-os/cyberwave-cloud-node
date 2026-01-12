@@ -62,10 +62,15 @@ def main() -> int:
         help="Node profile slug (overrides config file)",
     )
     start_parser.add_argument(
-        "--port",
+        "--mqtt-host",
+        default=None,
+        help="MQTT broker host (overrides config file)",
+    )
+    start_parser.add_argument(
+        "--mqtt-port",
         type=int,
         default=None,
-        help="Port to listen on (overrides config file)",
+        help="MQTT broker port (overrides config file)",
     )
 
     args = parser.parse_args()
@@ -121,12 +126,14 @@ def start_node(args: argparse.Namespace) -> int:
         # Apply CLI overrides
         if args.profile:
             config.profile_slug = args.profile
-        if args.port:
-            config.server_port = args.port
+        if args.mqtt_host:
+            config.mqtt_host = args.mqtt_host
+        if args.mqtt_port:
+            config.mqtt_port = args.mqtt_port
 
         logger.info(f"Starting Cloud Node '{args.slug}'")
         logger.info(f"Profile: {config.profile_slug}")
-        logger.info(f"Port: {config.server_port}")
+        logger.info(f"MQTT Broker: {config.mqtt_host}:{config.mqtt_port}")
         if config.inference:
             logger.info(f"Inference command: {config.inference}")
         if config.training:

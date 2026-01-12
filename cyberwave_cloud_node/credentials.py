@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-
 # Config directory (shared with cyberwave-cli)
 CONFIG_DIR = Path.home() / ".cyberwave"
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"

@@ -1,7 +1,15 @@
 # Cyberwave Cloud Node
 
-Turn any computer into a Cloude Node instance you can use to run inference or training with Cyberwave.
+Turn any computer into a Cloud Node instance you can use to run inference or training with Cyberwave.
 This subfolder contains the documentation of the package that helps developers create Cloud Node (GPU) instances that are cyberwave-ready in a few lines of code.
+
+## How it Works
+
+The Cloud Node connects to the Cyberwave MQTT broker to receive commands. This means:
+
+- **No public URL required** - The node connects outbound to MQTT, no need to expose ports
+- **Firewall friendly** - Works behind NAT and firewalls
+- **Real-time communication** - Commands are received instantly via MQTT subscription
 
 ## Quickstart
 
@@ -23,16 +31,17 @@ Then to the root of your repository you add a yaml file like this
 # cyberwave.yml
 cyberwave-cloud-node: # all of these should be bash commands
   install_script: ./install.sh # install what you need in the cloud GPU
-  inference: python ./inference.py --params {body} # put what you need. {body} will render to the stringified JSON params from the HTTP request. see later for examples
+  inference: python ./inference.py --params {body} # {body} will render to the stringified JSON params from the MQTT message
   training: python ./training.py --params {body}
 ```
 
-Behind the scenes, Cyberwave Cloude Node will take care of:
+Behind the scenes, Cyberwave Cloud Node will take care of:
 
 - Installing on startup and notifying you if it fails
 - Signaling to Cyberwave when the installation is complete, so you will see your GPU available in your workspace
+- Connecting to MQTT to receive commands
 - Sending an heartbeat signal
-- Processing inference and training requests, updating your Cyberwave GPU requests
+- Processing inference and training requests, publishing results back via MQTT
 
 ## Authentication
 
@@ -55,7 +64,10 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 - `CYBERWAVE_API_TOKEN`: Your Cyberwave API token
 - `CYBERWAVE_WORKSPACE_SLUG` (optional): Your workspace slug
 - `CYBERWAVE_API_URL` (optional): API URL (default: https://api.cyberwave.com)
-- `CYBERWAVE_ENDPOINT` (optional): Override the auto-detected endpoint URL
+- `CYBERWAVE_MQTT_HOST` (optional): MQTT broker host (default: mqtt.cyberwave.com)
+- `CYBERWAVE_MQTT_PORT` (optional): MQTT broker port (default: 1883)
+- `CYBERWAVE_MQTT_USERNAME` (optional): MQTT username if required
+- `CYBERWAVE_MQTT_PASSWORD` (optional): MQTT password if required
 
 ## CLI Usage
 
@@ -66,6 +78,9 @@ cyberwave-cloud-node start --slug my-gpu-node
 
 # With custom config file
 cyberwave-cloud-node start --slug my-gpu-node --config ./path/to/cyberwave.yml
+
+# With custom MQTT broker
+cyberwave-cloud-node start --slug my-gpu-node --mqtt-host localhost --mqtt-port 1883
 ```
 
 ## Programmatic Usage
@@ -83,9 +98,55 @@ config = CloudNodeConfig(
     inference="python inference.py --params {body}",
     training="python train.py --params {body}",
     profile_slug="gpu-a100",
+    mqtt_host="mqtt.cyberwave.com",
+    mqtt_port=1883,
 )
 node = CloudNode(slug="my-gpu-node", config=config)
 node.run()
+```
+
+## MQTT Topics
+
+The cloud node subscribes to command topics and publishes responses:
+
+**Command Topics** (subscribes to):
+
+- `cyberwave/cloud-node/{instance_uuid}/command`
+- `cyberwave/cloud-node/{slug}/command`
+
+**Response Topic** (publishes to):
+
+- `cyberwave/cloud-node/{instance_uuid}/response`
+
+### Command Message Format
+
+```json
+{
+  "command": "inference",
+  "request_id": "unique-request-id",
+  "params": {
+    "model": "gpt-4",
+    "input": "Hello world"
+  }
+}
+```
+
+Supported commands:
+
+- `inference` - Run the inference command
+- `training` - Run the training command
+- `status` - Get node status
+
+### Response Message Format
+
+```json
+{
+  "status": "ok",
+  "request_id": "unique-request-id",
+  "slug": "my-gpu-node",
+  "instance_uuid": "abc-123",
+  "output": "Command output here"
+}
 ```
 
 ## TODO

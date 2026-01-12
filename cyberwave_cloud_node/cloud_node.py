@@ -3,6 +3,7 @@
 This module provides the CloudNode class that orchestrates:
 - Running the install script on startup
 - Registering with the Cyberwave backend
+- Connecting to MQTT to receive workload commands
 - Sending periodic heartbeats
 - Processing inference and training workloads
 - Handling graceful shutdown
@@ -11,22 +12,17 @@ This module provides the CloudNode class that orchestrates:
 import asyncio
 import json
 import logging
-import os
 import shlex
 import signal
-import socket
-from contextlib import asynccontextmanager
+import uuid as uuid_module
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
+from cyberwave import Cyberwave  # type: ignore[import-untyped]
 
 from .client import CloudNodeClient, CloudNodeClientError
-from .config import CloudNodeConfig
+from .config import CloudNodeConfig, get_api_token, get_api_url
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +49,7 @@ class CloudNode:
     Manages the lifecycle of a cloud node instance:
     1. Runs install script (if configured)
     2. Registers with the Cyberwave backend
-    3. Starts HTTP server to receive workload requests
+    3. Connects to MQTT to receive workload commands
     4. Sends periodic heartbeats
     5. Executes inference/training workloads
     6. Handles graceful shutdown
@@ -85,7 +81,7 @@ class CloudNode:
         Args:
             slug: Unique identifier for this node within the workspace
             config: Node configuration (from cyberwave.yml or programmatic)
-            client: Optional pre-configured CloudNodeClient
+            client: Optional pre-configured CloudNodeClient (for REST API calls)
             working_dir: Working directory for running commands. Defaults to current directory.
         """
         self.slug = slug
@@ -93,10 +89,16 @@ class CloudNode:
         self.client = client or CloudNodeClient()
         self.working_dir = working_dir or Path.cwd()
 
+        # Generate a unique instance UUID for this session
+        self.instance_uuid = str(uuid_module.uuid4())
+
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
-        self._server_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
+
+        # Cyberwave SDK client for MQTT
+        self._cyberwave: Optional[Cyberwave] = None
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
     @classmethod
     def from_config_file(
@@ -139,14 +141,16 @@ class CloudNode:
         This is the main entry point for running the node. It will:
         1. Run the install script (if configured)
         2. Register with the backend
-        3. Start the HTTP server and heartbeat loop
-        4. Block until shutdown signal is received
+        3. Connect to MQTT and subscribe to command topics
+        4. Start the heartbeat loop
+        5. Block until shutdown signal is received
         """
         asyncio.run(self.run_async())
 
     async def run_async(self) -> None:
         """Run the Cloud Node service asynchronously."""
         self._running = True
+        self._event_loop = asyncio.get_running_loop()
         self._setup_signal_handlers()
 
         try:
@@ -154,16 +158,19 @@ class CloudNode:
             if self.config.install_script:
                 await self._run_install_script()
 
-            # Step 2: Get our endpoint URL
-            endpoint = self._get_endpoint_url()
-            logger.info(f"Cloud Node endpoint: {endpoint}")
+            # Step 2: Connect to MQTT
+            await self._connect_mqtt()
 
-            # Step 3: Register with backend
-            await self._register(endpoint)
+            # Step 3: Register with backend (REST API)
+            await self._register()
 
-            # Step 4: Start heartbeat loop and HTTP server
+            # Step 4: Subscribe to command topics
+            await self._subscribe_to_commands()
+
+            # Step 5: Start heartbeat loop
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            self._server_task = asyncio.create_task(self._run_server())
+
+            logger.info(f"Cloud Node '{self.slug}' is running. Waiting for commands via MQTT...")
 
             # Wait for shutdown signal
             await self._shutdown_event.wait()
@@ -175,6 +182,174 @@ class CloudNode:
 
         finally:
             await self._shutdown()
+
+    async def _connect_mqtt(self) -> None:
+        """Connect to the MQTT broker using the Cyberwave SDK."""
+        logger.info(f"Connecting to MQTT broker at {self.config.mqtt_host}:{self.config.mqtt_port}")
+
+        token = get_api_token()
+        if not token:
+            raise CloudNodeError(
+                "API token is required. Set CYBERWAVE_API_TOKEN environment variable."
+            )
+
+        self._cyberwave = Cyberwave(
+            token=token,
+            base_url=get_api_url(),
+            mqtt_host=self.config.mqtt_host,
+            mqtt_port=self.config.mqtt_port,
+            mqtt_username=self.config.mqtt_username,
+            mqtt_password=self.config.mqtt_password,
+        )
+
+        if not self._cyberwave.mqtt.connected:
+            self._cyberwave.mqtt.connect()
+
+        logger.info("Connected to MQTT broker")
+
+    async def _subscribe_to_commands(self) -> None:
+        """Subscribe to MQTT topics for receiving workload commands."""
+        if not self._cyberwave:
+            raise CloudNodeError("MQTT client not connected")
+
+        def on_command(data: Any) -> None:
+            """Handle incoming command messages."""
+            try:
+                payload = data if isinstance(data, dict) else {}
+
+                # Ignore status messages (responses)
+                if "status" in payload:
+                    return
+
+                command = payload.get("command")
+                request_id = payload.get("request_id")
+                params = payload.get("params", {})
+
+                if not command:
+                    logger.warning("Command message missing 'command' field")
+                    return
+
+                logger.info(f"Received command: {command} (request_id: {request_id})")
+
+                if self._event_loop is None:
+                    logger.error("Event loop not available")
+                    return
+
+                if command == "inference":
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_inference(params, request_id), self._event_loop
+                    )
+                elif command == "training":
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_training(params, request_id), self._event_loop
+                    )
+                elif command == "status":
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_status(request_id), self._event_loop
+                    )
+                else:
+                    logger.warning(f"Unknown command: {command}")
+                    self._publish_response(
+                        request_id, success=False, error=f"Unknown command: {command}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error processing command: {e}", exc_info=True)
+
+        # Subscribe to cloud-node command topic
+        # Topic pattern: cyberwave/cloud-node/{instance_uuid}/command
+        topic = f"cyberwave/cloud-node/{self.instance_uuid}/command"
+        self._cyberwave.mqtt.subscribe(topic, on_command)
+        logger.info(f"Subscribed to command topic: {topic}")
+
+        # Also subscribe to topic using slug for easier addressing
+        slug_topic = f"cyberwave/cloud-node/{self.slug}/command"
+        self._cyberwave.mqtt.subscribe(slug_topic, on_command)
+        logger.info(f"Subscribed to command topic: {slug_topic}")
+
+    def _publish_response(
+        self,
+        request_id: Optional[str],
+        success: bool,
+        output: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Publish a response message back via MQTT."""
+        if not self._cyberwave:
+            return
+
+        response = {
+            "status": "ok" if success else "error",
+            "request_id": request_id,
+            "slug": self.slug,
+            "instance_uuid": self.instance_uuid,
+        }
+
+        if output is not None:
+            response["output"] = output
+        if error is not None:
+            response["error"] = error
+
+        # Publish to response topic
+        topic = f"cyberwave/cloud-node/{self.instance_uuid}/response"
+        try:
+            self._cyberwave.mqtt._client.publish(topic, response)
+            logger.debug(f"Published response to {topic}")
+        except Exception as e:
+            logger.error(f"Failed to publish response: {e}")
+
+    async def _handle_inference(self, params: dict, request_id: Optional[str]) -> None:
+        """Handle an inference command."""
+        if not self.config.inference:
+            self._publish_response(
+                request_id,
+                success=False,
+                error="Inference command not configured in cyberwave.yml",
+            )
+            return
+
+        result = await self.execute_workload("inference", params)
+        self._publish_response(
+            request_id,
+            success=result.success,
+            output=result.output,
+            error=result.error,
+        )
+
+    async def _handle_training(self, params: dict, request_id: Optional[str]) -> None:
+        """Handle a training command."""
+        if not self.config.training:
+            self._publish_response(
+                request_id,
+                success=False,
+                error="Training command not configured in cyberwave.yml",
+            )
+            return
+
+        result = await self.execute_workload("training", params)
+        self._publish_response(
+            request_id,
+            success=result.success,
+            output=result.output,
+            error=result.error,
+        )
+
+    async def _handle_status(self, request_id: Optional[str]) -> None:
+        """Handle a status query."""
+        self._publish_response(
+            request_id,
+            success=True,
+            output=json.dumps(
+                {
+                    "slug": self.slug,
+                    "instance_uuid": self.instance_uuid,
+                    "profile_slug": self.config.profile_slug,
+                    "provider": self.config.provider,
+                    "has_inference": bool(self.config.inference),
+                    "has_training": bool(self.config.training),
+                }
+            ),
+        )
 
     async def _run_install_script(self) -> None:
         """Run the install script from cyberwave.yml."""
@@ -195,19 +370,19 @@ class CloudNode:
             logger.error(f"Install script failed: {e}")
             raise CloudNodeError(f"Install script failed: {e}") from e
 
-    async def _register(self, endpoint: str) -> None:
+    async def _register(self) -> None:
         """Register this node with the Cyberwave backend.
 
         Retries registration every 10 seconds if it fails (e.g., if the instance
         is in a transient state like 'terminating').
         """
-        logger.info(f"Registering Cloud Node '{self.slug}' at {endpoint}")
+        logger.info(f"Registering Cloud Node '{self.slug}' (instance: {self.instance_uuid})")
 
         while self._running:
             try:
                 response = self.client.register(
                     slug=self.slug,
-                    endpoint=endpoint,
+                    endpoint=f"mqtt://{self.instance_uuid}",  # MQTT-based endpoint
                     profile_slug=self.config.profile_slug,
                     provider=self.config.provider,
                 )
@@ -235,79 +410,6 @@ class CloudNode:
                 # Continue trying - the backend might be temporarily unavailable
 
             await asyncio.sleep(self.config.heartbeat_interval)
-
-    async def _run_server(self) -> None:
-        """Run the HTTP server to receive workload requests."""
-
-        class WorkloadRequest(BaseModel):
-            """Request body for workload execution."""
-
-            params: dict = {}
-
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            logger.info(f"Cloud Node server starting on port {self.config.server_port}")
-            yield
-            logger.info("Cloud Node server shutting down")
-
-        app = FastAPI(
-            title=f"Cyberwave Cloud Node - {self.slug}",
-            lifespan=lifespan,
-        )
-
-        @app.get("/health")
-        async def health():
-            """Health check endpoint."""
-            return {"status": "healthy", "slug": self.slug}
-
-        @app.post("/inference")
-        async def run_inference(request: WorkloadRequest):
-            """Execute an inference workload."""
-            if not self.config.inference:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Inference command not configured in cyberwave.yml",
-                )
-
-            result = await self.execute_workload("inference", request.params)
-            if not result.success:
-                raise HTTPException(status_code=500, detail=result.error)
-
-            return JSONResponse(
-                content={
-                    "success": True,
-                    "output": result.output,
-                }
-            )
-
-        @app.post("/training")
-        async def run_training(request: WorkloadRequest):
-            """Execute a training workload."""
-            if not self.config.training:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Training command not configured in cyberwave.yml",
-                )
-
-            result = await self.execute_workload("training", request.params)
-            if not result.success:
-                raise HTTPException(status_code=500, detail=result.error)
-
-            return JSONResponse(
-                content={
-                    "success": True,
-                    "output": result.output,
-                }
-            )
-
-        config = uvicorn.Config(
-            app,
-            host="0.0.0.0",
-            port=self.config.server_port,
-            log_level="info",
-        )
-        server = uvicorn.Server(config)
-        await server.serve()
 
     async def execute_workload(
         self,
@@ -381,29 +483,6 @@ class CloudNode:
                 error=str(e),
             )
 
-    def _get_endpoint_url(self) -> str:
-        """Get the endpoint URL for this node.
-
-        Tries to determine the public IP/hostname of this machine.
-        Can be overridden via CYBERWAVE_ENDPOINT env var.
-        """
-        # Allow explicit override
-        endpoint_override = os.getenv("CYBERWAVE_ENDPOINT")
-        if endpoint_override:
-            return endpoint_override
-
-        # Try to get a routable IP
-        try:
-            # Connect to a public DNS to get our routable IP
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            ip = "127.0.0.1"
-
-        return f"http://{ip}:{self.config.server_port}"
-
     def _setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
 
@@ -437,14 +516,23 @@ class CloudNode:
             except asyncio.CancelledError:
                 pass
 
-        # Notify backend of termination
+        # Notify backend of termination via REST API
         try:
             self.client.terminated(slug=self.slug)
             logger.info("Backend notified of termination")
         except CloudNodeClientError as e:
             logger.error(f"Failed to notify backend of termination: {e}")
 
-        # Close client
+        # Disconnect MQTT
+        if self._cyberwave:
+            try:
+                if self._cyberwave.mqtt:
+                    self._cyberwave.mqtt.disconnect()
+                self._cyberwave.disconnect()
+            except Exception as e:
+                logger.error(f"Error disconnecting from MQTT: {e}")
+
+        # Close REST client
         self.client.close()
 
         logger.info("Cloud Node shutdown complete")
