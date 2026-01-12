@@ -36,6 +36,7 @@ jobs:
 
       - name: Set version from tag or input
         id: version
+        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
@@ -50,7 +51,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      # TODO: install dependencies and build the binary
+      - name: Install dependencies
+        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[build]"
+
+      - name: Build binary with PyInstaller
+        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
+        run: |
+          chmod +x build.sh
+          ./build.sh
+          echo "✅ Binary built successfully"
+          ls -la dist/
+
+      - name: Verify binary works
+        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
+        run: |
+          ./dist/cyberwave-cloud-node --version || ./dist/cyberwave-cloud-node --help
+          echo "✅ Binary verification passed"
 
       - name: Create Debian package structure
         run: |
@@ -63,8 +82,8 @@ jobs:
           mkdir -p "${PKG_DIR}/usr/share/doc/${PACKAGE_NAME}"
 
           # Copy binary
-          cp dist/cyberwave-cli "${PKG_DIR}/usr/bin/"
-          chmod 755 "${PKG_DIR}/usr/bin/cyberwave-cli"
+          cp cyberwave-cloud-nodes/cyberwave-cloud-node/dist/cyberwave-cloud-node "${PKG_DIR}/usr/bin/"
+          chmod 755 "${PKG_DIR}/usr/bin/cyberwave-cloud-node"
 
           # Create control file
           cat > "${PKG_DIR}/DEBIAN/control" << EOF
@@ -75,13 +94,13 @@ jobs:
           Architecture: ${ARCH}
           Maintainer: Cyberwave <info@cyberwave.com>
           Homepage: https://cyberwave.com
-          Description: The official command-line interface for Cyberwave
-           Authenticate and bootstrap robotics projects from your terminal.
+          Description: Cyberwave Cloud Node for inference and training
+           Turn any computer into a Cyberwave Cloud Node for inference and training via MQTT.
            .
            Features:
-            - Authenticate with Cyberwave platform
-            - Bootstrap robot projects like SO-101
-            - Manage device connections
+            - Run inference workloads on demand
+            - Execute training jobs remotely
+            - Connect to Cyberwave platform via MQTT
           EOF
 
           # Remove leading spaces from control file (heredoc artifact)
@@ -90,9 +109,9 @@ jobs:
           # Create copyright file
           cat > "${PKG_DIR}/usr/share/doc/${PACKAGE_NAME}/copyright" << EOF
           Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-          Upstream-Name: cyberwave-cli
+          Upstream-Name: cyberwave-cloud-node
           Upstream-Contact: info@cyberwave.com
-          Source: https://github.com/cyberwave-os/cyberwave-cli
+          Source: https://github.com/cyberwave-os/cyberwave
 
           Files: *
           Copyright: $(date +%Y) Cyberwave

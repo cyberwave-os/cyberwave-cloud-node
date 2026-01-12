@@ -35,6 +35,9 @@ dev = [
     "mypy>=1.5.0",
     "ruff>=0.1.0",
 ]
+build = [
+    "pyinstaller>=6.0.0",
+]
 
 [project.scripts]
 cyberwave-cloud-node = "cyberwave_cloud_node.cli:main"
