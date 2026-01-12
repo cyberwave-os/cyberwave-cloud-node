@@ -18,6 +18,7 @@ import uuid as uuid_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+import os
 
 from cyberwave import Cyberwave  # type: ignore[import-untyped]
 
@@ -99,6 +100,15 @@ class CloudNode:
         # Cyberwave SDK client for MQTT
         self._cyberwave: Optional[Cyberwave] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Determine topic prefix from CYBERWAVE_ENVIRONMENT variable
+        env_value = os.getenv("CYBERWAVE_ENVIRONMENT", "").strip()
+        topic_prefix = ""
+        if not env_value or env_value.lower() == "production":
+            topic_prefix = ""
+        else:
+            topic_prefix = env_value
+        self._topic_prefix = topic_prefix
 
     @classmethod
     def from_config_file(
@@ -256,14 +266,14 @@ class CloudNode:
             except Exception as e:
                 logger.error(f"Error processing command: {e}", exc_info=True)
 
-        # Subscribe to cloud-node command topic
+        # Subscribe to cloud-node command topic. BUG: the uuid is not the same as the one the backend think it is.
         # Topic pattern: cyberwave/cloud-node/{instance_uuid}/command
-        topic = f"cyberwave/cloud-node/{self.instance_uuid}/command"
+        topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/command"
         self._cyberwave.mqtt.subscribe(topic, on_command)
         logger.info(f"Subscribed to command topic: {topic}")
 
         # Also subscribe to topic using slug for easier addressing
-        slug_topic = f"cyberwave/cloud-node/{self.slug}/command"
+        slug_topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.slug}/command"
         self._cyberwave.mqtt.subscribe(slug_topic, on_command)
         logger.info(f"Subscribed to command topic: {slug_topic}")
 
@@ -291,7 +301,7 @@ class CloudNode:
             response["error"] = error
 
         # Publish to response topic
-        topic = f"cyberwave/cloud-node/{self.instance_uuid}/response"
+        topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/response"
         try:
             self._cyberwave.mqtt._client.publish(topic, response)
             logger.debug(f"Published response to {topic}")
