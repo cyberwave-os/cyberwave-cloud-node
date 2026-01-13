@@ -36,7 +36,6 @@ jobs:
 
       - name: Set version from tag or input
         id: version
-        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
@@ -52,13 +51,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
         run: |
           pip install --upgrade pip
           pip install -e ".[build]"
 
       - name: Build binary with PyInstaller
-        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
         run: |
           chmod +x build.sh
           ./build.sh
@@ -66,7 +63,6 @@ jobs:
           ls -la dist/
 
       - name: Verify binary works
-        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
         run: |
           ./dist/cyberwave-cloud-node --version || ./dist/cyberwave-cloud-node --help
           echo "✅ Binary verification passed"
