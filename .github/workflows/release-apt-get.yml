@@ -63,7 +63,6 @@ jobs:
           ls -la dist/
 
       - name: Verify binary works
-        working-directory: cyberwave-cloud-nodes/cyberwave-cloud-node
         run: |
           ./dist/cyberwave-cloud-node --version || ./dist/cyberwave-cloud-node --help
           echo "✅ Binary verification passed"
