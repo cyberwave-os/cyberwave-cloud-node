@@ -354,7 +354,6 @@ class CloudNode:
                     "slug": self.slug,
                     "instance_uuid": self.instance_uuid,
                     "profile_slug": self.config.profile_slug,
-                    "provider": self.config.provider,
                     "has_inference": bool(self.config.inference),
                     "has_training": bool(self.config.training),
                 }
@@ -395,10 +394,8 @@ class CloudNode:
         while self._running:
             try:
                 response = self.client.register(
-                    endpoint=f"mqtt://{self.slug}",  # MQTT-based endpoint
                     profile_slug=self.config.profile_slug,
                     slug=self.slug,  # Optional hint, backend may generate different one
-                    provider=self.config.provider,
                 )
 
                 # Update instance identity with values from backend

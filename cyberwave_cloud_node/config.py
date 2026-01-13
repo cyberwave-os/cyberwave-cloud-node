@@ -118,7 +118,6 @@ class CloudNodeConfig:
     inference: Optional[str] = None
     training: Optional[str] = None
     profile_slug: str = "default"
-    provider: str = "self-hosted"
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
     mqtt_host: str = DEFAULT_MQTT_HOST
     mqtt_port: int = DEFAULT_MQTT_PORT
@@ -136,7 +135,6 @@ class CloudNodeConfig:
             inference=cloud_node_data.get("inference"),
             training=cloud_node_data.get("training"),
             profile_slug=cloud_node_data.get("profile_slug", "default"),
-            provider=cloud_node_data.get("provider", "self-hosted"),
             heartbeat_interval=cloud_node_data.get(
                 "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL
             ),
@@ -153,7 +151,6 @@ class CloudNodeConfig:
                     "inference",
                     "training",
                     "profile_slug",
-                    "provider",
                     "heartbeat_interval",
                     "mqtt_host",
                     "mqtt_port",
@@ -199,7 +196,6 @@ class CloudNodeConfig:
             inference=os.getenv("CYBERWAVE_INFERENCE_CMD"),
             training=os.getenv("CYBERWAVE_TRAINING_CMD"),
             profile_slug=os.getenv("CYBERWAVE_PROFILE_SLUG", "default"),
-            provider=os.getenv("CYBERWAVE_PROVIDER", "self-hosted"),
             heartbeat_interval=int(
                 os.getenv("CYBERWAVE_HEARTBEAT_INTERVAL", str(DEFAULT_HEARTBEAT_INTERVAL))
             ),

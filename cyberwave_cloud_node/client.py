@@ -158,11 +158,9 @@ class CloudNodeClient:
 
     def register(
         self,
-        endpoint: str,
         profile_slug: str,
         slug: Optional[str] = None,
         instance_uuid: Optional[str] = None,
-        provider: str = "self-hosted",
         workspace_slug: Optional[str] = None,
         save_identity: bool = True,
     ) -> RegisterResponse:
@@ -173,11 +171,9 @@ class CloudNodeClient:
         will generate them and return them in the response.
 
         Args:
-            endpoint: The URL where this node is listening (e.g., http://1.2.3.4:8080)
             profile_slug: The node profile slug (defines capabilities)
             slug: Optional slug for this instance (backend generates if not provided)
             instance_uuid: Optional UUID for re-registration of existing instance
-            provider: The cloud provider (default: self-hosted)
             workspace_slug: Optional workspace slug override
             save_identity: Whether to save the returned UUID/slug locally (default: True)
 
@@ -196,9 +192,7 @@ class CloudNodeClient:
                 logger.info(f"Using stored identity: uuid={instance_uuid}, slug={slug}")
 
         payload = {
-            "endpoint": endpoint,
             "profile_slug": profile_slug,
-            "provider": provider,
         }
 
         if slug:
