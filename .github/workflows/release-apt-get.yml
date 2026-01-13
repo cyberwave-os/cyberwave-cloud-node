@@ -78,7 +78,7 @@ jobs:
           mkdir -p "${PKG_DIR}/usr/share/doc/${PACKAGE_NAME}"
 
           # Copy binary
-          cp cyberwave-cloud-nodes/cyberwave-cloud-node/dist/cyberwave-cloud-node "${PKG_DIR}/usr/bin/"
+          cp dist/cyberwave-cloud-node "${PKG_DIR}/usr/bin/"
           chmod 755 "${PKG_DIR}/usr/bin/cyberwave-cloud-node"
 
           # Create control file
