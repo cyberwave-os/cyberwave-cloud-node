@@ -64,12 +64,14 @@ def main() -> int:
     start_parser.add_argument(
         "--mqtt-host",
         default=None,
+        dest="mqtt_host",
         help="MQTT broker host (overrides config file)",
     )
     start_parser.add_argument(
         "--mqtt-port",
         type=int,
         default=None,
+        dest="mqtt_port",
         help="MQTT broker port (overrides config file)",
     )
 
@@ -108,7 +110,7 @@ def start_node(args: argparse.Namespace) -> int:
             "  1. CYBERWAVE_API_TOKEN environment variable\n"
             "  2. .env file in current directory or ~/.cyberwave/.env\n"
             "  3. Login with cyberwave-cli (stores in ~/.cyberwave/credentials.json)\n\n"
-            "Get your token from https://app.cyberwave.com/settings/api-tokens"
+            "Get your token from https://cyberwave.com/profile"
         )
         return 1
 
