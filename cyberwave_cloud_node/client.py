@@ -21,6 +21,12 @@ from .config import (
     get_api_url,
     get_workspace_slug,
 )
+from .credentials import (
+    InstanceIdentity,
+    load_instance_identity,
+    save_instance_identity,
+    clear_instance_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +48,16 @@ class RegisterResponse:
 
     success: bool
     message: str
+    uuid: str
+    slug: str
 
     @classmethod
     def from_dict(cls, data: dict) -> "RegisterResponse":
         return cls(
             success=data.get("success", False),
             message=data.get("message", ""),
+            uuid=data.get("uuid", ""),
+            slug=data.get("slug", ""),
         )
 
 
@@ -148,35 +158,53 @@ class CloudNodeClient:
 
     def register(
         self,
-        slug: str,
         endpoint: str,
         profile_slug: str,
+        slug: Optional[str] = None,
+        instance_uuid: Optional[str] = None,
         provider: str = "self-hosted",
         workspace_slug: Optional[str] = None,
+        save_identity: bool = True,
     ) -> RegisterResponse:
         """Register this Cloud Node instance with the backend.
 
         Called after the node has booted and is ready to serve workloads.
+        The backend owns UUID and slug generation - if not provided, the backend
+        will generate them and return them in the response.
 
         Args:
-            slug: Unique slug for this instance within the workspace
             endpoint: The URL where this node is listening (e.g., http://1.2.3.4:8080)
             profile_slug: The node profile slug (defines capabilities)
+            slug: Optional slug for this instance (backend generates if not provided)
+            instance_uuid: Optional UUID for re-registration of existing instance
             provider: The cloud provider (default: self-hosted)
             workspace_slug: Optional workspace slug override
+            save_identity: Whether to save the returned UUID/slug locally (default: True)
 
         Returns:
-            RegisterResponse with success status and message
+            RegisterResponse with success status, message, uuid and slug
 
         Raises:
             CloudNodeClientError: If registration fails
         """
+        # Try to use stored identity for re-registration if not explicitly provided
+        if not instance_uuid and not slug:
+            stored_identity = load_instance_identity()
+            if stored_identity:
+                instance_uuid = stored_identity.uuid
+                slug = stored_identity.slug
+                logger.info(f"Using stored identity: uuid={instance_uuid}, slug={slug}")
+
         payload = {
-            "slug": slug,
             "endpoint": endpoint,
             "profile_slug": profile_slug,
             "provider": provider,
         }
+
+        if slug:
+            payload["slug"] = slug
+        if instance_uuid:
+            payload["instance_uuid"] = instance_uuid
 
         ws_slug = workspace_slug or self.workspace_slug
         if ws_slug:
@@ -186,7 +214,20 @@ class CloudNodeClient:
             response = self._client.post(CLOUD_NODE_REGISTER_ENDPOINT, json=payload)
 
             if response.status_code == 200:
-                return RegisterResponse.from_dict(response.json())
+                result = RegisterResponse.from_dict(response.json())
+
+                # Save the identity locally for future use
+                if save_identity and result.success:
+                    identity = InstanceIdentity(
+                        uuid=result.uuid,
+                        slug=result.slug,
+                        workspace_slug=ws_slug,
+                    )
+                    clear_instance_identity()
+                    save_instance_identity(identity)
+                    logger.info(f"Saved instance identity: uuid={result.uuid}, slug={result.slug}")
+
+                return result
 
             self._handle_error_response(response, "register")
 
@@ -204,20 +245,30 @@ class CloudNodeClient:
         """Send a heartbeat to signal the node is alive.
 
         Called periodically to prevent the backend from marking this instance as stale.
+        If no slug or instance_uuid is provided, uses the stored identity from registration.
 
         Args:
-            slug: Instance slug (required if instance_uuid not provided)
-            instance_uuid: Instance UUID (required if slug not provided)
+            slug: Instance slug (uses stored identity if not provided)
+            instance_uuid: Instance UUID (uses stored identity if not provided)
             workspace_slug: Optional workspace slug override
 
         Returns:
             HeartbeatResponse with success status
 
         Raises:
-            CloudNodeClientError: If heartbeat fails
+            CloudNodeClientError: If heartbeat fails or no identity is available
         """
+        # Auto-load stored identity if not provided
         if not slug and not instance_uuid:
-            raise CloudNodeClientError("Either slug or instance_uuid is required for heartbeat")
+            stored_identity = load_instance_identity()
+            if stored_identity:
+                instance_uuid = stored_identity.uuid
+                slug = stored_identity.slug
+            else:
+                raise CloudNodeClientError(
+                    "No instance identity found. "
+                    "Call register() first or provide slug/instance_uuid."
+                )
 
         payload = {}
         if slug:
@@ -251,20 +302,30 @@ class CloudNodeClient:
         """Notify the backend that this instance is terminating.
 
         Called during graceful shutdown.
+        If no slug or instance_uuid is provided, uses the stored identity from registration.
 
         Args:
-            slug: Instance slug (required if instance_uuid not provided)
-            instance_uuid: Instance UUID (required if slug not provided)
+            slug: Instance slug (uses stored identity if not provided)
+            instance_uuid: Instance UUID (uses stored identity if not provided)
             workspace_slug: Optional workspace slug override
 
         Returns:
             TerminatedResponse with success status
 
         Raises:
-            CloudNodeClientError: If notification fails
+            CloudNodeClientError: If notification fails or no identity is available
         """
+        # Auto-load stored identity if not provided
         if not slug and not instance_uuid:
-            raise CloudNodeClientError("Either slug or instance_uuid is required")
+            stored_identity = load_instance_identity()
+            if stored_identity:
+                instance_uuid = stored_identity.uuid
+                slug = stored_identity.slug
+            else:
+                raise CloudNodeClientError(
+                    "No instance identity found. "
+                    "Call register() first or provide slug/instance_uuid."
+                )
 
         payload = {}
         if slug:
@@ -301,21 +362,31 @@ class CloudNodeClient:
         """Notify the backend that this instance has failed.
 
         Called when a critical error occurs that prevents the node from functioning.
+        If no slug or instance_uuid is provided, uses the stored identity from registration.
 
         Args:
             error: Description of the failure
-            slug: Instance slug (required if instance_uuid not provided)
-            instance_uuid: Instance UUID (required if slug not provided)
+            slug: Instance slug (uses stored identity if not provided)
+            instance_uuid: Instance UUID (uses stored identity if not provided)
             workspace_slug: Optional workspace slug override
 
         Returns:
             FailedResponse with success status
 
         Raises:
-            CloudNodeClientError: If notification fails
+            CloudNodeClientError: If notification fails or no identity is available
         """
+        # Auto-load stored identity if not provided
         if not slug and not instance_uuid:
-            raise CloudNodeClientError("Either slug or instance_uuid is required")
+            stored_identity = load_instance_identity()
+            if stored_identity:
+                instance_uuid = stored_identity.uuid
+                slug = stored_identity.slug
+            else:
+                raise CloudNodeClientError(
+                    "No instance identity found. "
+                    "Call register() first or provide slug/instance_uuid."
+                )
 
         payload = {"error": error}
         if slug:

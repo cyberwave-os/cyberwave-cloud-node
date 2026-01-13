@@ -12,13 +12,12 @@ This module provides the CloudNode class that orchestrates:
 import asyncio
 import json
 import logging
+import os
 import shlex
 import signal
-import uuid as uuid_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-import os
 
 from cyberwave import Cyberwave  # type: ignore[import-untyped]
 
@@ -90,8 +89,9 @@ class CloudNode:
         self.client = client or CloudNodeClient()
         self.working_dir = working_dir or Path.cwd()
 
-        # Generate a unique instance UUID for this session
-        self.instance_uuid = str(uuid_module.uuid4())
+        # Instance UUID will be assigned by the backend during registration.
+        # Initialize as empty - will be populated after successful registration.
+        self.instance_uuid: str = ""
 
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -266,7 +266,7 @@ class CloudNode:
             except Exception as e:
                 logger.error(f"Error processing command: {e}", exc_info=True)
 
-        # Subscribe to cloud-node command topic. BUG: the uuid is not the same as the one the backend think it is.
+        # Subscribe to cloud-node command topic
         # Topic pattern: cyberwave/cloud-node/{instance_uuid}/command
         topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/command"
         self._cyberwave.mqtt.subscribe(topic, on_command)
@@ -385,18 +385,29 @@ class CloudNode:
 
         Retries registration every 10 seconds if it fails (e.g., if the instance
         is in a transient state like 'terminating').
+
+        The backend owns the UUID and slug - after successful registration,
+        this method updates self.instance_uuid and self.slug with the values
+        returned by the backend.
         """
-        logger.info(f"Registering Cloud Node '{self.slug}' (instance: {self.instance_uuid})")
+        logger.info(f"Registering Cloud Node '{self.slug}'")
 
         while self._running:
             try:
                 response = self.client.register(
-                    slug=self.slug,
-                    endpoint=f"mqtt://{self.instance_uuid}",  # MQTT-based endpoint
+                    endpoint=f"mqtt://{self.slug}",  # MQTT-based endpoint
                     profile_slug=self.config.profile_slug,
+                    slug=self.slug,  # Optional hint, backend may generate different one
                     provider=self.config.provider,
                 )
+
+                # Update instance identity with values from backend
+                # The backend is the owner of UUID and slug
+                self.instance_uuid = response.uuid
+                self.slug = response.slug
+
                 logger.info(f"Registration successful: {response.message}")
+                logger.info(f"Instance UUID: {self.instance_uuid}, Slug: {self.slug}")
                 return
 
             except CloudNodeClientError as e:
