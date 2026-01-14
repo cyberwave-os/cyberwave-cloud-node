@@ -25,10 +25,11 @@ jobs:
     strategy:
       matrix:
         include:
-          # Use ubuntu-22.04 for GLIBC 2.35 compatibility
-          # This works on Ubuntu 22.04+ and most modern Linux distros
+          # Use ubuntu-20.04 for GLIBC 2.31 compatibility
+          # This works on Ubuntu 20.04+, Debian 11+, and most Linux from 2020+
           - arch: amd64
-            runner: ubuntu-22.04
+            runner: ubuntu-20.04
+          # Note: ubuntu-20.04-arm is not available, using 22.04 for arm64
           - arch: arm64
             runner: ubuntu-22.04-arm
 
