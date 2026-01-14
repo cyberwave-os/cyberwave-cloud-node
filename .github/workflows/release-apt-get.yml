@@ -22,18 +22,32 @@ jobs:
   build-deb:
     name: Build Debian Package (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     strategy:
       matrix:
         include:
-          # Use ubuntu-20.04 for GLIBC 2.31 compatibility
-          # This works on Ubuntu 20.04+, Debian 11+, and most Linux from 2020+
+          # Use ubuntu:20.04 container for GLIBC 2.31 compatibility
+          # Run on ubuntu-latest (fast runners) but build in older container
           - arch: amd64
-            runner: ubuntu-20.04
-          # Note: ubuntu-20.04-arm is not available, using 22.04 for arm64
+            runner: ubuntu-latest
+            container: ubuntu:20.04
           - arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
+            container: ubuntu:20.04
 
     steps:
+      - name: Install git and dependencies in container
+        run: |
+          apt-get update
+          apt-get install -y git curl software-properties-common
+          # Add deadsnakes PPA for Python 3.11
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip
+          # Make python3.11 the default
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+          update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -48,20 +62,40 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "📦 Building version: $VERSION"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e ".[build]"
+          python3.11 -m pip install --upgrade pip
+          python3.11 -m pip install -e ".[build]"
 
       - name: Build binary with PyInstaller
         run: |
-          chmod +x build.sh
-          ./build.sh
+          # Create wrapper entry point with absolute imports (required for PyInstaller)
+          cat > __pyinstaller_entry.py << 'EOF'
+          """PyInstaller entry point for Cyberwave Cloud Node."""
+          from cyberwave_cloud_node.cli import main
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          # Remove heredoc indentation
+          sed -i 's/^          //' __pyinstaller_entry.py
+
+          python3.11 -m PyInstaller \
+            --onefile \
+            --name cyberwave-cloud-node \
+            --hidden-import cyberwave_cloud_node \
+            --hidden-import cyberwave_cloud_node.cli \
+            --hidden-import cyberwave_cloud_node.client \
+            --hidden-import cyberwave_cloud_node.cloud_node \
+            --hidden-import cyberwave_cloud_node.config \
+            --hidden-import cyberwave_cloud_node.credentials \
+            --hidden-import httpx \
+            --hidden-import yaml \
+            --hidden-import dotenv \
+            --hidden-import cyberwave \
+            __pyinstaller_entry.py
+
+          rm -f __pyinstaller_entry.py
           echo "✅ Binary built successfully"
           ls -la dist/
 
