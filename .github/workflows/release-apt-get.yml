@@ -22,13 +22,20 @@ jobs:
   build-deb:
     name: Build Debian Package (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     strategy:
       matrix:
         include:
+          # Use manylinux_2_28 containers for maximum GLIBC compatibility
+          # These have GLIBC 2.28, compatible with Ubuntu 18.04+, Debian 10+, RHEL 8+
           - arch: amd64
             runner: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            python: /opt/python/cp311-cp311/bin/python
           - arch: arm64
             runner: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            python: /opt/python/cp311-cp311/bin/python
 
     steps:
       - name: Checkout code
@@ -45,20 +52,42 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "📦 Building version: $VERSION"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e ".[build]"
+          ${{ matrix.python }} -m pip install --upgrade pip
+          ${{ matrix.python }} -m pip install -e ".[build]"
 
       - name: Build binary with PyInstaller
         run: |
-          chmod +x build.sh
-          ./build.sh
+          # Create wrapper entry point with absolute imports (required for PyInstaller)
+          cat > __pyinstaller_entry.py << 'ENTRY_EOF'
+          """PyInstaller entry point for Cyberwave Cloud Node."""
+          from cyberwave_cloud_node.cli import main
+
+          if __name__ == "__main__":
+              main()
+          ENTRY_EOF
+          # Remove heredoc indentation from the Python file
+          sed -i 's/^          //' __pyinstaller_entry.py
+
+          # Use the container's Python and pyinstaller
+          ${{ matrix.python }} -m PyInstaller \
+            --onefile \
+            --name cyberwave-cloud-node \
+            --hidden-import cyberwave_cloud_node \
+            --hidden-import cyberwave_cloud_node.cli \
+            --hidden-import cyberwave_cloud_node.client \
+            --hidden-import cyberwave_cloud_node.cloud_node \
+            --hidden-import cyberwave_cloud_node.config \
+            --hidden-import cyberwave_cloud_node.credentials \
+            --hidden-import httpx \
+            --hidden-import yaml \
+            --hidden-import dotenv \
+            --hidden-import cyberwave \
+            __pyinstaller_entry.py
+
+          # Cleanup
+          rm -f __pyinstaller_entry.py
           echo "✅ Binary built successfully"
           ls -la dist/
 
@@ -66,6 +95,11 @@ jobs:
         run: |
           ./dist/cyberwave-cloud-node --version || ./dist/cyberwave-cloud-node --help
           echo "✅ Binary verification passed"
+
+      - name: Install dpkg for Debian packaging
+        run: |
+          # manylinux containers are CentOS-based, need to install dpkg
+          yum install -y dpkg
 
       - name: Create Debian package structure
         run: |
