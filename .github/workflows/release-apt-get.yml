@@ -37,6 +37,9 @@ jobs:
 
     steps:
       - name: Install git and dependencies in container
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          TZ: UTC
         run: |
           apt-get update
           apt-get install -y git curl software-properties-common
