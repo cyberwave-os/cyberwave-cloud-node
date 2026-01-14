@@ -26,32 +26,22 @@ jobs:
     strategy:
       matrix:
         include:
-          # Use ubuntu:20.04 container for GLIBC 2.31 compatibility
-          # Run on ubuntu-latest (fast runners) but build in older container
+          # Use python:3.10-slim-bullseye for GLIBC 2.31 compatibility
+          # Bullseye has same GLIBC as Ubuntu 20.04
           - arch: amd64
             runner: ubuntu-latest
-            container: ubuntu:20.04
+            container: python:3.10-slim-bullseye
           - arch: arm64
             runner: ubuntu-24.04-arm
-            container: ubuntu:20.04
+            container: python:3.10-slim-bullseye
 
     steps:
-      - name: Install git and dependencies in container
+      - name: Install build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
-          TZ: UTC
         run: |
           apt-get update
-          apt-get install -y git curl software-properties-common gnupg
-          # Add deadsnakes PPA for Python 3.10 (--update ensures apt cache is refreshed)
-          add-apt-repository -y --update ppa:deadsnakes/ppa
-          # Clear apt cache and re-fetch to ensure PPA packages are visible
-          rm -rf /var/lib/apt/lists/*
-          apt-get update
-          apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip
-          # Make python3.10 the default
-          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
-          update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1
+          apt-get install -y git curl binutils
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -69,8 +59,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.10 -m pip install --upgrade pip
-          python3.10 -m pip install -e ".[build]"
+          pip install --upgrade pip
+          pip install -e ".[build]"
 
       - name: Build binary with PyInstaller
         run: |
@@ -85,7 +75,7 @@ jobs:
           # Remove heredoc indentation
           sed -i 's/^          //' __pyinstaller_entry.py
 
-          python3.10 -m PyInstaller \
+          python -m PyInstaller \
             --onefile \
             --name cyberwave-cloud-node \
             --hidden-import cyberwave_cloud_node \
