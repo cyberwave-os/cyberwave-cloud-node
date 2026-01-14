@@ -1,8 +1,9 @@
 """Command-line interface for Cyberwave Cloud Node.
 
 Usage:
-    cyberwave-cloud-node start --slug my-node
-    cyberwave-cloud-node start --slug my-node --config ./cyberwave.yml
+    cyberwave-cloud-node start
+    cyberwave-cloud-node start --config ./cyberwave.yml
+    cyberwave-cloud-node start --slug my-node  # Optional: provide a slug hint
 """
 
 import argparse
@@ -47,8 +48,8 @@ def main() -> int:
     )
     start_parser.add_argument(
         "--slug",
-        required=True,
-        help="Unique identifier for this node within your workspace",
+        default=None,
+        help="Optional slug hint for this node (backend assigns the actual slug)",
     )
     start_parser.add_argument(
         "--config",
@@ -133,7 +134,8 @@ def start_node(args: argparse.Namespace) -> int:
         if args.mqtt_port:
             config.mqtt_port = args.mqtt_port
 
-        logger.info(f"Starting Cloud Node '{args.slug}'")
+        if args.slug:
+            logger.info(f"Starting Cloud Node with slug hint '{args.slug}'")
         logger.info(f"Profile: {config.profile_slug}")
         logger.info(f"MQTT Broker: {config.mqtt_host}:{config.mqtt_port}")
         if config.inference:
@@ -143,8 +145,8 @@ def start_node(args: argparse.Namespace) -> int:
 
         # Create and run the node
         node = CloudNode(
-            slug=args.slug,
             config=config,
+            slug=args.slug,  # Optional hint, backend assigns actual slug
             working_dir=working_dir,
         )
         node.run()

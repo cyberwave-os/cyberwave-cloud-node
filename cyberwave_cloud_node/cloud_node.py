@@ -61,30 +61,31 @@ class CloudNode:
 
         # Or programmatically
         node = CloudNode(
-            slug="my-gpu-node",
             config=CloudNodeConfig(
                 inference="python inference.py --params {body}",
             ),
+            slug="my-gpu-node",  # Optional hint, backend assigns actual slug
         )
         node.run()
     """
 
     def __init__(
         self,
-        slug: str,
         config: CloudNodeConfig,
+        slug: Optional[str] = None,
         client: Optional[CloudNodeClient] = None,
         working_dir: Optional[Path] = None,
     ):
         """Initialize a Cloud Node.
 
         Args:
-            slug: Unique identifier for this node within the workspace
             config: Node configuration (from cyberwave.yml or programmatic)
+            slug: Optional slug hint for this node (backend assigns the actual slug)
             client: Optional pre-configured CloudNodeClient (for REST API calls)
             working_dir: Working directory for running commands. Defaults to current directory.
         """
-        self.slug = slug
+        # Slug is optional - will be assigned by backend during registration
+        self.slug: str = slug or ""
         self.config = config
         self.client = client or CloudNodeClient()
         self.working_dir = working_dir or Path.cwd()
@@ -113,15 +114,15 @@ class CloudNode:
     @classmethod
     def from_config_file(
         cls,
-        slug: str,
         config_path: Optional[Path] = None,
+        slug: Optional[str] = None,
         client: Optional[CloudNodeClient] = None,
     ) -> "CloudNode":
         """Create a CloudNode from a cyberwave.yml config file.
 
         Args:
-            slug: Unique identifier for this node
             config_path: Path to config file. Defaults to cyberwave.yml in current directory.
+            slug: Optional slug hint for this node (backend assigns the actual slug)
             client: Optional pre-configured CloudNodeClient
 
         Returns:
@@ -129,21 +130,25 @@ class CloudNode:
         """
         config = CloudNodeConfig.from_file(config_path)
         working_dir = config_path.parent if config_path else Path.cwd()
-        return cls(slug=slug, config=config, client=client, working_dir=working_dir)
+        return cls(config=config, slug=slug, client=client, working_dir=working_dir)
 
     @classmethod
-    def from_env(cls, slug: str, client: Optional[CloudNodeClient] = None) -> "CloudNode":
+    def from_env(
+        cls,
+        slug: Optional[str] = None,
+        client: Optional[CloudNodeClient] = None,
+    ) -> "CloudNode":
         """Create a CloudNode from environment variables.
 
         Args:
-            slug: Unique identifier for this node
+            slug: Optional slug hint for this node (backend assigns the actual slug)
             client: Optional pre-configured CloudNodeClient
 
         Returns:
             CloudNode instance
         """
         config = CloudNodeConfig.from_env()
-        return cls(slug=slug, config=config, client=client)
+        return cls(config=config, slug=slug, client=client)
 
     def run(self) -> None:
         """Run the Cloud Node service synchronously.
@@ -180,7 +185,10 @@ class CloudNode:
             # Step 5: Start heartbeat loop
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-            logger.info(f"Cloud Node '{self.slug}' is running. Waiting for commands via MQTT...")
+            logger.info(
+                f"Cloud Node '{self.slug}' (uuid: {self.instance_uuid}) is running. "
+                "Waiting for commands via MQTT..."
+            )
 
             # Wait for shutdown signal
             await self._shutdown_event.wait()
@@ -389,13 +397,16 @@ class CloudNode:
         this method updates self.instance_uuid and self.slug with the values
         returned by the backend.
         """
-        logger.info(f"Registering Cloud Node '{self.slug}'")
+        if self.slug:
+            logger.info(f"Registering Cloud Node with slug hint '{self.slug}'")
+        else:
+            logger.info("Registering Cloud Node (backend will assign slug)")
 
         while self._running:
             try:
                 response = self.client.register(
                     profile_slug=self.config.profile_slug,
-                    slug=self.slug,  # Optional hint, backend may generate different one
+                    slug=self.slug or None,  # Optional hint, backend assigns actual slug
                 )
 
                 # Update instance identity with values from backend
