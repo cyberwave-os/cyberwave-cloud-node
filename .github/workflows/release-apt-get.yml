@@ -42,9 +42,11 @@ jobs:
           TZ: UTC
         run: |
           apt-get update
-          apt-get install -y git curl software-properties-common
-          # Add deadsnakes PPA for Python 3.10
-          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get install -y git curl software-properties-common gnupg
+          # Add deadsnakes PPA for Python 3.10 (--update ensures apt cache is refreshed)
+          add-apt-repository -y --update ppa:deadsnakes/ppa
+          # Clear apt cache and re-fetch to ensure PPA packages are visible
+          rm -rf /var/lib/apt/lists/*
           apt-get update
           apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip
           # Make python3.10 the default
