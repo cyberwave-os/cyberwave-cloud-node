@@ -20,7 +20,7 @@ Environment Variables:
     CYBERWAVE_API_URL: API base URL (default: https://api.cyberwave.com)
     CYBERWAVE_API_TOKEN: Your Cyberwave API token
     CYBERWAVE_WORKSPACE_SLUG: Your workspace slug (optional)
-    CYBERWAVE_ENDPOINT: Override the detected endpoint URL (optional)
+    CYBERWAVE_INSTANCE_SLUG: Instance slug hint (optional, for automated deployments)
 """
 
 from .client import (

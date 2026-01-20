@@ -87,6 +87,21 @@ def get_workspace_slug() -> Optional[str]:
     return creds_module.get_workspace_slug()
 
 
+def get_instance_slug() -> Optional[str]:
+    """Get the instance slug from environment or stored identity.
+
+    Priority:
+    1. CYBERWAVE_INSTANCE_SLUG environment variable
+    2. Stored identity in ~/.cyberwave/instance_identity.json
+    """
+    slug = os.getenv("CYBERWAVE_INSTANCE_SLUG")
+    if slug:
+        return slug
+
+    # Fall back to stored identity
+    return creds_module.get_instance_slug()
+
+
 def get_mqtt_host() -> str:
     """Get MQTT broker host from environment or default."""
     return os.getenv("CYBERWAVE_MQTT_HOST", DEFAULT_MQTT_HOST)

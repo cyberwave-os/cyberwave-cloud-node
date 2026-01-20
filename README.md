@@ -22,26 +22,32 @@ pip install cyberwave-cloud-node
 
 # or if you want the compiled version
 
-sudo apt get install cyberwave-cloud-node
+sudo apt-get install cyberwave-cloud-node
 ```
 
 Then to the root of your repository you add a yaml file like this
 
 ```yaml
 # cyberwave.yml
-cyberwave-cloud-node: # all of these should be bash commands
-  install_script: ./install.sh # install what you need in the cloud GPU
-  inference: python ./inference.py --params {body} # {body} will render to the stringified JSON params from the MQTT message
+cyberwave-cloud-node:
+  install_script: ./install.sh          # install what you need in the cloud GPU
+  inference: python ./inference.py --params {body}  # {body} renders to JSON params from MQTT
   training: python ./training.py --params {body}
+  profile_slug: gpu-a100                # optional: node profile (default: "default")
+  heartbeat_interval: 30                # optional: heartbeat interval in seconds
+  mqtt_host: mqtt.cyberwave.com         # optional: custom MQTT broker
+  mqtt_port: 1883                       # optional: custom MQTT port
 ```
 
 Behind the scenes, Cyberwave Cloud Node will take care of:
 
-- Installing on startup and notifying you if it fails
-- Signaling to Cyberwave when the installation is complete, so you will see your GPU available in your workspace
+- Running the install script on startup and notifying you if it fails
+- Registering with the Cyberwave backend to get a UUID and slug
+- Storing identity locally for re-registration support
 - Connecting to MQTT to receive commands
-- Sending an heartbeat signal
+- Sending periodic heartbeats
 - Processing inference and training requests, publishing results back via MQTT
+- Graceful shutdown with termination notification
 
 ## Authentication
 
@@ -61,49 +67,94 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 
 ## Environment Variables
 
+### Required
+
 - `CYBERWAVE_API_TOKEN`: Your Cyberwave API token
-- `CYBERWAVE_WORKSPACE_SLUG` (optional): Your workspace slug
-- `CYBERWAVE_API_URL` (optional): API URL (default: https://api.cyberwave.com)
-- `CYBERWAVE_MQTT_HOST` (optional): MQTT broker host (default: mqtt.cyberwave.com)
-- `CYBERWAVE_MQTT_PORT` (optional): MQTT broker port (default: 1883)
-- `CYBERWAVE_MQTT_USERNAME` (optional): MQTT username if required
-- `CYBERWAVE_MQTT_PASSWORD` (optional): MQTT password if required
+
+### Optional - API & Workspace
+
+- `CYBERWAVE_WORKSPACE_SLUG`: Your workspace slug
+- `CYBERWAVE_INSTANCE_SLUG`: Instance slug hint (useful for automated deployments)
+- `CYBERWAVE_API_URL`: API URL (default: https://api.cyberwave.com)
+
+### Optional - MQTT
+
+- `CYBERWAVE_MQTT_HOST`: MQTT broker host (default: mqtt.cyberwave.com)
+- `CYBERWAVE_MQTT_PORT`: MQTT broker port (default: 1883)
+- `CYBERWAVE_MQTT_USERNAME`: MQTT username if required
+- `CYBERWAVE_MQTT_PASSWORD`: MQTT password if required
+- `CYBERWAVE_ENVIRONMENT`: Environment prefix for MQTT topics (empty for production)
+
+### Optional - Commands (alternative to cyberwave.yml)
+
+- `CYBERWAVE_INSTALL_SCRIPT`: Install script command
+- `CYBERWAVE_INFERENCE_CMD`: Inference command template
+- `CYBERWAVE_TRAINING_CMD`: Training command template
+- `CYBERWAVE_PROFILE_SLUG`: Node profile slug (default: "default")
+- `CYBERWAVE_HEARTBEAT_INTERVAL`: Heartbeat interval in seconds (default: 30)
 
 ## CLI Usage
 
 ```bash
-# Start the cloud node
+# Start the cloud node (backend assigns UUID and slug)
 export CYBERWAVE_API_TOKEN=your-token-here
+cyberwave-cloud-node start
+
+# With a slug hint (backend may use this or assign a different one)
 cyberwave-cloud-node start --slug my-gpu-node
 
 # With custom config file
-cyberwave-cloud-node start --slug my-gpu-node --config ./path/to/cyberwave.yml
+cyberwave-cloud-node start --config ./path/to/cyberwave.yml
+
+# With profile override
+cyberwave-cloud-node start --profile gpu-a100
 
 # With custom MQTT broker
-cyberwave-cloud-node start --slug my-gpu-node --mqtt-host localhost --mqtt-port 1883
+cyberwave-cloud-node start --mqtt-host localhost --mqtt-port 1883
+
+# Verbose logging
+cyberwave-cloud-node start -v
 ```
+
+Note: The `--slug` parameter is a hint. The backend is the owner of UUIDs and slugs - it may use your hint or assign a different one.
 
 ## Programmatic Usage
 
 ```python
 from cyberwave_cloud_node import CloudNode, CloudNodeConfig
 
-# From config file
+# From config file (recommended)
+node = CloudNode.from_config_file()
+node.run()
+
+# With a slug hint
 node = CloudNode.from_config_file(slug="my-gpu-node")
 node.run()
 
-# Or programmatically
+# From environment variables
+node = CloudNode.from_env()
+node.run()
+
+# Or fully programmatic
 config = CloudNodeConfig(
     install_script="./install.sh",
     inference="python inference.py --params {body}",
     training="python train.py --params {body}",
     profile_slug="gpu-a100",
+    heartbeat_interval=30,
     mqtt_host="mqtt.cyberwave.com",
     mqtt_port=1883,
 )
-node = CloudNode(slug="my-gpu-node", config=config)
+node = CloudNode(config=config, slug="my-gpu-node")
 node.run()
 ```
+
+## Instance Identity
+
+After successful registration, the backend assigns a UUID and slug to your node. This identity is stored locally in `~/.cyberwave/instance_identity.json` for:
+
+- **Re-registration**: If the node restarts, it will re-register with the same identity
+- **Debugging**: You can inspect the file to see your node's assigned UUID and slug
 
 ## MQTT Topics
 
@@ -146,6 +197,18 @@ Supported commands:
   "slug": "my-gpu-node",
   "instance_uuid": "abc-123",
   "output": "Command output here"
+}
+```
+
+On error:
+
+```json
+{
+  "status": "error",
+  "request_id": "unique-request-id",
+  "slug": "my-gpu-node",
+  "instance_uuid": "abc-123",
+  "error": "Error message here"
 }
 ```
 

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from .cloud_node import CloudNode, CloudNodeError
-from .config import CloudNodeConfig, get_api_token, load_dotenv_files
+from .config import CloudNodeConfig, get_api_token, get_instance_slug, load_dotenv_files
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -134,8 +134,11 @@ def start_node(args: argparse.Namespace) -> int:
         if args.mqtt_port:
             config.mqtt_port = args.mqtt_port
 
-        if args.slug:
-            logger.info(f"Starting Cloud Node with slug hint '{args.slug}'")
+        # Get instance slug: CLI arg > env var > stored identity
+        slug = args.slug or get_instance_slug()
+
+        if slug:
+            logger.info(f"Starting Cloud Node with slug hint '{slug}'")
         logger.info(f"Profile: {config.profile_slug}")
         logger.info(f"MQTT Broker: {config.mqtt_host}:{config.mqtt_port}")
         if config.inference:
@@ -146,7 +149,7 @@ def start_node(args: argparse.Namespace) -> int:
         # Create and run the node
         node = CloudNode(
             config=config,
-            slug=args.slug,  # Optional hint, backend assigns actual slug
+            slug=slug,  # Optional hint, backend assigns actual slug
             working_dir=working_dir,
         )
         node.run()
