@@ -15,6 +15,7 @@ import httpx
 from .config import (
     CLOUD_NODE_FAILED_ENDPOINT,
     CLOUD_NODE_HEARTBEAT_ENDPOINT,
+    CLOUD_NODE_LOG_ENDPOINT,
     CLOUD_NODE_REGISTER_ENDPOINT,
     CLOUD_NODE_TERMINATED_ENDPOINT,
     get_api_token,
@@ -23,9 +24,9 @@ from .config import (
 )
 from .credentials import (
     InstanceIdentity,
+    clear_instance_identity,
     load_instance_identity,
     save_instance_identity,
-    clear_instance_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,21 @@ class FailedResponse:
 
     @classmethod
     def from_dict(cls, data: dict) -> "FailedResponse":
+        return cls(
+            success=data.get("success", False),
+            message=data.get("message", ""),
+        )
+
+
+@dataclass
+class LogResponse:
+    """Response from the log endpoint."""
+
+    success: bool
+    message: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LogResponse":
         return cls(
             success=data.get("success", False),
             message=data.get("message", ""),
@@ -404,6 +420,73 @@ class CloudNodeClient:
             raise CloudNodeClientError(f"Connection error during failure notification: {e}") from e
 
         raise CloudNodeClientError("Failure notification failed")
+
+    def send_log(
+        self,
+        log_content: str,
+        log_type: str = "stdout",
+        slug: Optional[str] = None,
+        instance_uuid: Optional[str] = None,
+        workspace_slug: Optional[str] = None,
+    ) -> LogResponse:
+        """Send log content to the backend for storage.
+
+        Logs are stored asynchronously in GCS by the backend.
+        If no slug or instance_uuid is provided, uses the stored identity from registration.
+
+        Args:
+            log_content: The log content to send
+            log_type: Type of log ("stdout", "stderr", "system", "app")
+            slug: Instance slug (uses stored identity if not provided)
+            instance_uuid: Instance UUID (uses stored identity if not provided)
+            workspace_slug: Optional workspace slug override
+
+        Returns:
+            LogResponse with success status
+
+        Raises:
+            CloudNodeClientError: If sending fails or no identity is available
+        """
+        if not log_content:
+            return LogResponse(success=True, message="No log content to send")
+
+        # Auto-load stored identity if not provided
+        if not slug and not instance_uuid:
+            stored_identity = load_instance_identity()
+            if stored_identity:
+                instance_uuid = stored_identity.uuid
+                slug = stored_identity.slug
+            else:
+                raise CloudNodeClientError(
+                    "No instance identity found. "
+                    "Call register() first or provide slug/instance_uuid."
+                )
+
+        payload = {
+            "log_type": log_type,
+            "log_content": log_content,
+        }
+        if slug:
+            payload["slug"] = slug
+        if instance_uuid:
+            payload["instance_uuid"] = instance_uuid
+
+        ws_slug = workspace_slug or self.workspace_slug
+        if ws_slug:
+            payload["workspace_slug"] = ws_slug
+
+        try:
+            response = self._client.post(CLOUD_NODE_LOG_ENDPOINT, json=payload)
+
+            if response.status_code == 200:
+                return LogResponse.from_dict(response.json())
+
+            self._handle_error_response(response, "send_log")
+
+        except httpx.RequestError as e:
+            raise CloudNodeClientError(f"Connection error during log send: {e}") from e
+
+        raise CloudNodeClientError("Log send failed")
 
     def _handle_error_response(self, response: httpx.Response, operation: str) -> None:
         """Handle error responses from the API."""

@@ -16,6 +16,7 @@ CLOUD_NODE_REGISTER_ENDPOINT = "/api/v1/cloud-node/register"
 CLOUD_NODE_HEARTBEAT_ENDPOINT = "/api/v1/cloud-node/heartbeat"
 CLOUD_NODE_TERMINATED_ENDPOINT = "/api/v1/cloud-node/terminated"
 CLOUD_NODE_FAILED_ENDPOINT = "/api/v1/cloud-node/failed"
+CLOUD_NODE_LOG_ENDPOINT = "/api/v1/cloud-node/log"
 
 # MQTT Configuration
 DEFAULT_MQTT_HOST = "mqtt.cyberwave.com"

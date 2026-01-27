@@ -96,7 +96,14 @@ class CloudNode:
 
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._log_flush_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
+
+        # Log buffers for stdout and stderr
+        self._stdout_buffer: list[str] = []
+        self._stderr_buffer: list[str] = []
+        self._log_buffer_lock = asyncio.Lock()
+        self._log_flush_interval = 30  # seconds
 
         # Cyberwave SDK client for MQTT
         self._cyberwave: Optional[Cyberwave] = None
@@ -184,6 +191,9 @@ class CloudNode:
 
             # Step 5: Start heartbeat loop
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+            # Step 6: Start log flush loop
+            self._log_flush_task = asyncio.create_task(self._log_flush_loop())
 
             logger.info(
                 f"Cloud Node '{self.slug}' (uuid: {self.instance_uuid}) is running. "
@@ -440,6 +450,71 @@ class CloudNode:
 
             await asyncio.sleep(self.config.heartbeat_interval)
 
+    async def _log_flush_loop(self) -> None:
+        """Periodically flush buffered logs to the backend."""
+        logger.info(f"Starting log flush loop (interval: {self._log_flush_interval}s)")
+
+        while self._running:
+            await asyncio.sleep(self._log_flush_interval)
+            await self._flush_logs()
+
+    async def _flush_logs(self) -> None:
+        """Flush buffered logs to the backend."""
+        async with self._log_buffer_lock:
+            # Flush stdout buffer
+            if self._stdout_buffer:
+                stdout_content = "\n".join(self._stdout_buffer)
+                self._stdout_buffer.clear()
+                try:
+                    self.client.send_log(
+                        log_content=stdout_content,
+                        log_type="stdout",
+                        instance_uuid=self.instance_uuid,
+                    )
+                    logger.debug(f"Flushed {len(stdout_content)} bytes of stdout logs")
+                except CloudNodeClientError as e:
+                    logger.warning(f"Failed to flush stdout logs: {e}")
+                    # Re-add to buffer for next attempt (but limit size)
+                    self._stdout_buffer.insert(0, stdout_content)
+                    self._truncate_buffer(self._stdout_buffer)
+
+            # Flush stderr buffer
+            if self._stderr_buffer:
+                stderr_content = "\n".join(self._stderr_buffer)
+                self._stderr_buffer.clear()
+                try:
+                    self.client.send_log(
+                        log_content=stderr_content,
+                        log_type="stderr",
+                        instance_uuid=self.instance_uuid,
+                    )
+                    logger.debug(f"Flushed {len(stderr_content)} bytes of stderr logs")
+                except CloudNodeClientError as e:
+                    logger.warning(f"Failed to flush stderr logs: {e}")
+                    # Re-add to buffer for next attempt (but limit size)
+                    self._stderr_buffer.insert(0, stderr_content)
+                    self._truncate_buffer(self._stderr_buffer)
+
+    def _truncate_buffer(self, buffer: list[str], max_lines: int = 10000) -> None:
+        """Truncate buffer to prevent unbounded growth."""
+        if len(buffer) > max_lines:
+            # Keep the most recent lines
+            del buffer[:-max_lines]
+
+    async def _buffer_log(self, content: str, log_type: str = "stdout") -> None:
+        """Add log content to the appropriate buffer."""
+        if not content:
+            return
+
+        async with self._log_buffer_lock:
+            lines = content.splitlines()
+            if log_type == "stderr":
+                self._stderr_buffer.extend(lines)
+                self._truncate_buffer(self._stderr_buffer)
+            else:
+                self._stdout_buffer.extend(lines)
+                self._truncate_buffer(self._stdout_buffer)
+
     async def execute_workload(
         self,
         workload_type: str,
@@ -492,6 +567,12 @@ class CloudNode:
             stdout_str = stdout.decode("utf-8") if stdout else ""
             stderr_str = stderr.decode("utf-8") if stderr else ""
 
+            # Buffer logs for periodic sending to backend
+            if stdout_str:
+                await self._buffer_log(stdout_str, "stdout")
+            if stderr_str:
+                await self._buffer_log(stderr_str, "stderr")
+
             if process.returncode == 0:
                 return WorkloadResult(
                     success=True,
@@ -507,6 +588,8 @@ class CloudNode:
                 )
 
         except Exception as e:
+            # Buffer the error as well
+            await self._buffer_log(str(e), "stderr")
             return WorkloadResult(
                 success=False,
                 error=str(e),
@@ -544,6 +627,20 @@ class CloudNode:
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
+
+        if self._log_flush_task:
+            self._log_flush_task.cancel()
+            try:
+                await self._log_flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Flush any remaining logs before shutdown
+        try:
+            await self._flush_logs()
+            logger.info("Final log flush completed")
+        except Exception as e:
+            logger.error(f"Failed to flush logs during shutdown: {e}")
 
         # Notify backend of termination via REST API
         try:
