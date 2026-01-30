@@ -9,6 +9,7 @@ Usage:
 import argparse
 import logging
 import sys
+from importlib.metadata import version
 from pathlib import Path
 
 from .cloud_node import CloudNode, CloudNodeError
@@ -30,6 +31,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="cyberwave-cloud-node",
         description="Turn any computer into a Cyberwave Cloud Node for inference and training",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {version('cyberwave-cloud-node')}",
     )
 
     parser.add_argument(
