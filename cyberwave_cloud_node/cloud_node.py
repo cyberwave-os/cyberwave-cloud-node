@@ -263,6 +263,18 @@ class CloudNode:
                     logger.error("Event loop not available")
                     return
 
+                try:
+                    msg = {}
+                    msg["command"] = command
+                    msg["request_id"] = request_id
+                    msg["received"] = "true"
+                    topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/telemetry"
+                    if self._cyberwave and self._cyberwave.mqtt and self._cyberwave.mqtt._client:
+                        self._cyberwave.mqtt._client.publish(topic, msg)
+                    logger.debug(f"Published command received response to {topic}")
+                except Exception as e:
+                    logger.error(f"Failed to publish command received response: {e}")
+
                 if command == "inference":
                     asyncio.run_coroutine_threadsafe(
                         self._handle_inference(params, request_id), self._event_loop
