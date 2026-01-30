@@ -268,10 +268,13 @@ class CloudNode:
                     msg["command"] = command
                     msg["request_id"] = request_id
                     msg["received"] = "true"
-                    topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/telemetry"
-                    if self._cyberwave and self._cyberwave.mqtt and self._cyberwave.mqtt._client:
-                        self._cyberwave.mqtt._client.publish(topic, msg)
-                    logger.debug(f"Published command received response to {topic}")
+                    topic = (
+                        f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/telemetry"
+                    )
+                    # TODO: reinstate telemetry
+                    # if self._cyberwave and self._cyberwave.mqtt and self._cyberwave.mqtt._client:
+                    #     self._cyberwave.mqtt._client.publish(topic, msg)
+                    # logger.debug(f"Published command received response to {topic}")
                 except Exception as e:
                     logger.error(f"Failed to publish command received response: {e}")
 
