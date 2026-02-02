@@ -316,11 +316,6 @@ class CloudNode:
         self._cyberwave.mqtt.subscribe(topic, on_command)
         logger.info(f"Subscribed to command topic: {topic}")
 
-        # Also subscribe to topic using slug for easier addressing
-        slug_topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.slug}/command"
-        self._cyberwave.mqtt.subscribe(slug_topic, on_command)
-        logger.info(f"Subscribed to command topic: {slug_topic}")
-
     def _publish_response(
         self,
         request_id: Optional[str],
