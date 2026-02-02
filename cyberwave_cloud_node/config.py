@@ -12,7 +12,8 @@ from . import credentials as creds_module  # noqa: E402
 
 # API Configuration
 DEFAULT_API_URL = "https://api.cyberwave.com"
-CLOUD_NODE_REGISTER_ENDPOINT = "/api/v1/cloud-node/register"
+CLOUD_NODE_CREATE_INSTANCE_ENDPOINT = "/api/v1/cloud-node"
+CLOUD_NODE_REGISTER_ENDPOINT = "/api/v1/cloud-node/{uuid}/register"
 CLOUD_NODE_HEARTBEAT_ENDPOINT = "/api/v1/cloud-node/heartbeat"
 CLOUD_NODE_TERMINATED_ENDPOINT = "/api/v1/cloud-node/terminated"
 CLOUD_NODE_FAILED_ENDPOINT = "/api/v1/cloud-node/failed"
