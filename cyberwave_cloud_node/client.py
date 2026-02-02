@@ -20,6 +20,7 @@ from .config import (
     CLOUD_NODE_TERMINATED_ENDPOINT,
     get_api_token,
     get_api_url,
+    get_instance_uuid,
     get_workspace_slug,
 )
 from .credentials import (
@@ -176,7 +177,6 @@ class CloudNodeClient:
         self,
         profile_slug: str,
         slug: Optional[str] = None,
-        instance_uuid: Optional[str] = None,
         workspace_slug: Optional[str] = None,
         save_identity: bool = True,
     ) -> RegisterResponse:
@@ -199,12 +199,21 @@ class CloudNodeClient:
         Raises:
             CloudNodeClientError: If registration fails
         """
-        # Try to use stored identity for re-registration if not explicitly provided
-        if not instance_uuid and not slug:
+        # Try to load instance UUID from environment or stored identity for re-registration
+        instance_uuid = None
+        # First check environment variable for instance_uuid
+        instance_uuid = get_instance_uuid()
+        if instance_uuid:
+            logger.info(f"Using instance UUID from environment: {instance_uuid}")
+
+        # Load stored identity if we still need slug or instance_uuid
+        if not slug or not instance_uuid:
             stored_identity = load_instance_identity()
             if stored_identity:
-                instance_uuid = stored_identity.uuid
-                slug = stored_identity.slug
+                if not instance_uuid:
+                    instance_uuid = stored_identity.uuid
+                if not slug:
+                    slug = stored_identity.slug
                 logger.info(f"Using stored identity: uuid={instance_uuid}, slug={slug}")
 
         payload = {
@@ -268,17 +277,24 @@ class CloudNodeClient:
         Raises:
             CloudNodeClientError: If heartbeat fails or no identity is available
         """
-        # Auto-load stored identity if not provided
-        if not slug and not instance_uuid:
+        # Auto-load instance UUID/slug from environment or stored identity if not provided
+        # First check environment variable for instance_uuid
+        if not instance_uuid:
+            instance_uuid = get_instance_uuid()
+
+        # Load stored identity if we still need either value
+        if not instance_uuid or not slug:
             stored_identity = load_instance_identity()
             if stored_identity:
-                instance_uuid = stored_identity.uuid
-                slug = stored_identity.slug
-            else:
-                raise CloudNodeClientError(
-                    "No instance identity found. "
-                    "Call register() first or provide slug/instance_uuid."
-                )
+                if not instance_uuid:
+                    instance_uuid = stored_identity.uuid
+                if not slug:
+                    slug = stored_identity.slug
+
+        if not instance_uuid and not slug:
+            raise CloudNodeClientError(
+                "No instance identity found. Call register() first or provide slug/instance_uuid."
+            )
 
         payload = {}
         if slug:
@@ -325,17 +341,24 @@ class CloudNodeClient:
         Raises:
             CloudNodeClientError: If notification fails or no identity is available
         """
-        # Auto-load stored identity if not provided
-        if not slug and not instance_uuid:
+        # Auto-load instance UUID/slug from environment or stored identity if not provided
+        # First check environment variable for instance_uuid
+        if not instance_uuid:
+            instance_uuid = get_instance_uuid()
+
+        # Load stored identity if we still need either value
+        if not instance_uuid or not slug:
             stored_identity = load_instance_identity()
             if stored_identity:
-                instance_uuid = stored_identity.uuid
-                slug = stored_identity.slug
-            else:
-                raise CloudNodeClientError(
-                    "No instance identity found. "
-                    "Call register() first or provide slug/instance_uuid."
-                )
+                if not instance_uuid:
+                    instance_uuid = stored_identity.uuid
+                if not slug:
+                    slug = stored_identity.slug
+
+        if not instance_uuid and not slug:
+            raise CloudNodeClientError(
+                "No instance identity found. Call register() first or provide slug/instance_uuid."
+            )
 
         payload = {}
         if slug:
@@ -386,17 +409,24 @@ class CloudNodeClient:
         Raises:
             CloudNodeClientError: If notification fails or no identity is available
         """
-        # Auto-load stored identity if not provided
-        if not slug and not instance_uuid:
+        # Auto-load instance UUID/slug from environment or stored identity if not provided
+        # First check environment variable for instance_uuid
+        if not instance_uuid:
+            instance_uuid = get_instance_uuid()
+
+        # Load stored identity if we still need either value
+        if not instance_uuid or not slug:
             stored_identity = load_instance_identity()
             if stored_identity:
-                instance_uuid = stored_identity.uuid
-                slug = stored_identity.slug
-            else:
-                raise CloudNodeClientError(
-                    "No instance identity found. "
-                    "Call register() first or provide slug/instance_uuid."
-                )
+                if not instance_uuid:
+                    instance_uuid = stored_identity.uuid
+                if not slug:
+                    slug = stored_identity.slug
+
+        if not instance_uuid and not slug:
+            raise CloudNodeClientError(
+                "No instance identity found. Call register() first or provide slug/instance_uuid."
+            )
 
         payload = {"error": error}
         if slug:
@@ -450,17 +480,24 @@ class CloudNodeClient:
         if not log_content:
             return LogResponse(success=True, message="No log content to send")
 
-        # Auto-load stored identity if not provided
-        if not slug and not instance_uuid:
+        # Auto-load instance UUID/slug from environment or stored identity if not provided
+        # First check environment variable for instance_uuid
+        if not instance_uuid:
+            instance_uuid = get_instance_uuid()
+
+        # Load stored identity if we still need either value
+        if not instance_uuid or not slug:
             stored_identity = load_instance_identity()
             if stored_identity:
-                instance_uuid = stored_identity.uuid
-                slug = stored_identity.slug
-            else:
-                raise CloudNodeClientError(
-                    "No instance identity found. "
-                    "Call register() first or provide slug/instance_uuid."
-                )
+                if not instance_uuid:
+                    instance_uuid = stored_identity.uuid
+                if not slug:
+                    slug = stored_identity.slug
+
+        if not instance_uuid and not slug:
+            raise CloudNodeClientError(
+                "No instance identity found. Call register() first or provide slug/instance_uuid."
+            )
 
         payload = {
             "log_type": log_type,

@@ -88,6 +88,21 @@ def get_workspace_slug() -> Optional[str]:
     return creds_module.get_workspace_slug()
 
 
+def get_instance_uuid() -> Optional[str]:
+    """Get the instance UUID from environment or stored identity.
+
+    Priority:
+    1. CYBERWAVE_CLOUD_NODE_INSTANCE_UUID environment variable
+    2. Stored identity in ~/.cyberwave/instance_identity.json
+    """
+    uuid = os.getenv("CYBERWAVE_CLOUD_NODE_INSTANCE_UUID")
+    if uuid:
+        return uuid
+
+    # Fall back to stored identity
+    return creds_module.get_instance_uuid()
+
+
 def get_instance_slug() -> Optional[str]:
     """Get the instance slug from environment or stored identity.
 
