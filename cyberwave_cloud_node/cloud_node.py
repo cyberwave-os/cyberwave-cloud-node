@@ -186,10 +186,17 @@ class CloudNode:
             # Step 3: Register with backend (REST API)
             await self._register()
 
+            # Ensure instance_uuid is set after registration
+            if not self.instance_uuid:
+                raise CloudNodeError(
+                    "Registration completed but instance_uuid is not set. "
+                    "Cannot start heartbeat loop without instance UUID."
+                )
+
             # Step 4: Subscribe to command topics
             await self._subscribe_to_commands()
 
-            # Step 5: Start heartbeat loop
+            # Step 5: Start heartbeat loop (only after registration and UUID is set)
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
             # Step 6: Start log flush loop
@@ -289,6 +296,10 @@ class CloudNode:
                 elif command == "status":
                     asyncio.run_coroutine_threadsafe(
                         self._handle_status(request_id), self._event_loop
+                    )
+                elif command == "workload_received":
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_workload_received(params, request_id), self._event_loop
                     )
                 else:
                     logger.warning(f"Unknown command: {command}")
@@ -393,6 +404,38 @@ class CloudNode:
             ),
         )
 
+    async def _handle_workload_received(
+        self, params: dict, request_id: Optional[str]
+    ) -> None:
+        """Handle a workload_received notification.
+
+        This is called when a workload is assigned to this instance.
+        The params contain the full workload details including workload_uuid,
+        profile_slug, status, command_type, and command_params.
+        """
+        workload_uuid = params.get("workload_uuid")
+        command_type = params.get("command_type")
+        command_params = params.get("command_params") or {}
+
+        logger.info(
+            f"Workload {workload_uuid} assigned to this instance "
+            f"(command_type={command_type}, status={params.get('status')})"
+        )
+
+        # If there's a command_type, execute it
+        if command_type == "inference":
+            await self._handle_inference(command_params, request_id)
+        elif command_type == "training":
+            await self._handle_training(command_params, request_id)
+        else:
+            # No specific command type - just acknowledge receipt
+            logger.info(f"Workload {workload_uuid} received (no command_type specified)")
+            self._publish_response(
+                request_id,
+                success=True,
+                output=f"Workload {workload_uuid} received and acknowledged",
+            )
+
     async def _run_install_script(self) -> None:
         """Run the install script from cyberwave.yml."""
         if not self.config.install_script:
@@ -456,7 +499,9 @@ class CloudNode:
 
         while self._running:
             try:
-                response = self.client.heartbeat(slug=self.slug)
+                response = self.client.heartbeat(
+                    slug=self.slug, instance_uuid=self.instance_uuid
+                )
                 logger.debug(f"Heartbeat sent: {response.message}")
 
             except CloudNodeClientError as e:

@@ -254,9 +254,10 @@ class CloudNodeClient:
 
         Called after the node has booted and is ready to serve workloads.
 
-        Two registration flows:
+        Registration flow:
         1. If instance UUID is available (from env or stored identity):
-           - Register directly using the UUID endpoint
+           - Try to register directly using the UUID endpoint
+           - If 404 (instance doesn't exist), create it first, then register
         2. If instance UUID is NOT available:
            - First create the instance via create_instance()
            - Then register it using the returned UUID
@@ -292,16 +293,12 @@ class CloudNodeClient:
 
         ws_slug = workspace_slug or self.workspace_slug
 
-        # Flow 1: UUID exists - register directly
+        # If UUID exists, try to register directly first
         if instance_uuid:
-            logger.info(f"Registering existing instance with UUID: {instance_uuid}")
+            logger.info(f"Attempting to register existing instance with UUID: {instance_uuid}")
             payload = {
                 "profile_slug": profile_slug,
             }
-            if slug:
-                payload["slug"] = slug
-            if ws_slug:
-                payload["workspace_slug"] = ws_slug
 
             try:
                 # Use UUID-based endpoint: /api/v1/cloud-node/{uuid}/register
@@ -326,52 +323,34 @@ class CloudNodeClient:
 
                     return result
 
-                self._handle_error_response(response, "register")
+                # If 404, instance doesn't exist - need to create it first
+                if response.status_code == 404:
+                    logger.warning(
+                        f"Instance {instance_uuid} not found. Creating new instance first."
+                    )
+                    # Fall through to create + register flow below
+                else:
+                    self._handle_error_response(response, "register")
 
             except httpx.RequestError as e:
                 raise CloudNodeClientError(f"Connection error during registration: {e}") from e
 
-            raise CloudNodeClientError("Registration failed")
-
-        # Flow 2: UUID does not exist - create instance first, then register
-        logger.info("No instance UUID found, creating new instance first")
+        # Create instance first (if UUID doesn't exist or registration returned 404)
+        logger.info("Creating new instance before registration")
         try:
             # Step 1: Create the instance using the create endpoint
-            # Note: create_instance requires workspace_uuid in payload, but we have workspace_slug.
-            # The backend's require_workspace decorator resolves workspace from user context,
-            # but the schema validation requires workspace_uuid. We'll try to create with
-            # workspace_slug as query param, and if that fails, we'll generate a UUID and
-            # use the register endpoint which can create the instance.
-            try:
-                create_result = self.create_instance(
-                    profile_slug=profile_slug,
-                    slug=slug,
-                    workspace_slug=ws_slug,
-                )
-                instance_uuid = create_result.uuid
-                logger.info(f"Created instance with UUID: {instance_uuid}")
-            except CloudNodeClientError as e:
-                # If create_instance fails (e.g., due to missing workspace_uuid),
-                # generate a UUID and use register endpoint which will create the instance
-                if e.status_code == 400 and "workspace" in str(e).lower():
-                    logger.warning(
-                        "create_instance requires workspace_uuid, falling back to register endpoint"
-                    )
-                    # Generate a UUID for the new instance
-                    instance_uuid = str(uuid_lib.uuid4())
-                    logger.info(f"Generated UUID for new instance: {instance_uuid}")
-                else:
-                    raise
+            create_result = self.create_instance(
+                profile_slug=profile_slug,
+                slug=slug,
+                workspace_slug=ws_slug,
+            )
+            instance_uuid = create_result.uuid
+            logger.info(f"Created instance with UUID: {instance_uuid}")
 
             # Step 2: Register the instance using the UUID
-            # The register endpoint will create the instance if it doesn't exist
             payload = {
                 "profile_slug": profile_slug,
             }
-            if slug:
-                payload["slug"] = slug
-            if ws_slug:
-                payload["workspace_slug"] = ws_slug
 
             endpoint = CLOUD_NODE_REGISTER_ENDPOINT.format(uuid=instance_uuid)
             response = self._client.post(endpoint, json=payload)
@@ -435,23 +414,18 @@ class CloudNodeClient:
                 if not slug:
                     slug = stored_identity.slug
 
-        if not instance_uuid and not slug:
+        # instance_uuid is REQUIRED for heartbeat (backend requires UUID in path)
+        if not instance_uuid:
             raise CloudNodeClientError(
-                "No instance identity found. Call register() first or provide slug/instance_uuid."
+                "instance_uuid is required for heartbeat. "
+                "Call register() first or provide instance_uuid."
             )
 
-        payload = {}
-        if slug:
-            payload["slug"] = slug
-        if instance_uuid:
-            payload["instance_uuid"] = instance_uuid
-
-        ws_slug = workspace_slug or self.workspace_slug
-        if ws_slug:
-            payload["workspace_slug"] = ws_slug
-
+        # Use UUID-based endpoint: /api/v1/cloud-node/{uuid}/heartbeat
+        # No payload needed - UUID is in the path
         try:
-            response = self._client.post(CLOUD_NODE_HEARTBEAT_ENDPOINT, json=payload)
+            endpoint = CLOUD_NODE_HEARTBEAT_ENDPOINT.format(uuid=instance_uuid)
+            response = self._client.post(endpoint, json={})
 
             if response.status_code == 200:
                 return HeartbeatResponse.from_dict(response.json())
