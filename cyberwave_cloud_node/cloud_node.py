@@ -279,9 +279,9 @@ class CloudNode:
                         f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/telemetry"
                     )
                     # TODO: reinstate telemetry
-                    # if self._cyberwave and self._cyberwave.mqtt and self._cyberwave.mqtt._client:
-                    #     self._cyberwave.mqtt._client.publish(topic, msg)
-                    # logger.debug(f"Published command received response to {topic}")
+                    if self._cyberwave and self._cyberwave.mqtt and self._cyberwave.mqtt._client:
+                        self._cyberwave.mqtt._client.publish(topic, msg)
+                    logger.debug(f"Published command received response to {topic}")
                 except Exception as e:
                     logger.error(f"Failed to publish command received response: {e}")
 
@@ -357,7 +357,7 @@ class CloudNode:
             )
             return
 
-        result = await self.execute_workload("inference", params)
+        result = await self.execute_workload("inference", params, request_id=request_id)
         self._publish_response(
             request_id,
             success=result.success,
@@ -375,7 +375,7 @@ class CloudNode:
             )
             return
 
-        result = await self.execute_workload("training", params)
+        result = await self.execute_workload("training", params, request_id=request_id)
         self._publish_response(
             request_id,
             success=result.success,
@@ -439,7 +439,8 @@ class CloudNode:
         logger.info(f"Running install script: {self.config.install_script}")
 
         try:
-            result = await self._run_command(self.config.install_script)
+            # Install scripts run directly (not in tmux)
+            result = await self._run_command_direct(self.config.install_script)
             if not result.success:
                 raise CloudNodeError(
                     f"Install script failed with code {result.return_code}: {result.error}"
@@ -574,12 +575,14 @@ class CloudNode:
         self,
         workload_type: str,
         params: dict,
+        request_id: Optional[str] = None,
     ) -> WorkloadResult:
         """Execute an inference or training workload.
 
         Args:
             workload_type: Either "inference" or "training"
             params: Parameters to pass to the command
+            request_id: Optional request ID for tmux session naming
 
         Returns:
             WorkloadResult with output or error
@@ -599,10 +602,159 @@ class CloudNode:
         command = command_template.replace("{body}", shlex.quote(params_json))
 
         logger.info(f"Executing {workload_type} workload: {command}")
-        return await self._run_command(command)
+        return await self._run_command(command, workload_type=workload_type, request_id=request_id)
 
-    async def _run_command(self, command: str) -> WorkloadResult:
-        """Run a shell command and return the result.
+    async def _run_command(
+        self,
+        command: str,
+        workload_type: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> WorkloadResult:
+        """Run a shell command in a tmux session and return the result.
+
+        Args:
+            command: Shell command to execute
+            workload_type: Optional workload type (inference/training) for tmux session naming
+            request_id: Optional request ID for tmux session naming
+
+        Returns:
+            WorkloadResult with output and status
+        """
+        import time
+
+        # Generate tmux session name
+        if request_id:
+            # Use request_id if available (usually workload UUID)
+            session_name = f"cyberwave-{request_id[:8]}"
+        elif workload_type:
+            # Fallback to workload_type + timestamp
+            timestamp = int(time.time())
+            session_name = f"cyberwave-{workload_type}-{timestamp}"
+        else:
+            # Generic fallback
+            timestamp = int(time.time())
+            session_name = f"cyberwave-{timestamp}"
+
+        # Sanitize session name (tmux session names must be alphanumeric, hyphens, underscores)
+        session_name = "".join(c if c.isalnum() or c in "-_" else "-" for c in session_name)
+        session_name = session_name[:64]  # tmux has a limit on session name length
+
+        # Create output files for capturing stdout/stderr
+        stdout_file = self.working_dir / f".cyberwave-{session_name}.stdout"
+        stderr_file = self.working_dir / f".cyberwave-{session_name}.stderr"
+
+        try:
+            # Build tmux command to run in detached session
+            # The command redirects stdout/stderr to files and captures exit code
+            exit_code_file = self.working_dir / f".cyberwave-{session_name}.exit"
+            bash_command = (
+                f"{command} > {shlex.quote(str(stdout_file))} "
+                f"2> {shlex.quote(str(stderr_file))}; "
+                f"echo $? > {shlex.quote(str(exit_code_file))}"
+            )
+            tmux_command = (
+                f"tmux new-session -d -s {shlex.quote(session_name)} "
+                f"-c {shlex.quote(str(self.working_dir))} "
+                f"bash -c {shlex.quote(bash_command)}"
+            )
+
+            logger.info(f"Starting tmux session '{session_name}' for command execution")
+            logger.info(f"Attach with: tmux attach -t {session_name}")
+
+            # Create the tmux session
+            process = await asyncio.create_subprocess_shell(
+                tmux_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            await process.wait()
+
+            if process.returncode != 0:
+                stderr = (await process.stderr.read()).decode("utf-8") if process.stderr else ""
+                logger.error(f"Failed to create tmux session: {stderr}")
+                # Fallback to direct execution if tmux fails
+                return await self._run_command_direct(command)
+
+            # Wait for command to complete (poll tmux session)
+            max_wait_time = 3600 * 24  # 24 hours max
+            poll_interval = 1.0  # Check every second
+            elapsed = 0.0
+
+            while elapsed < max_wait_time:
+                # Check if session still exists (command still running)
+                check_process = await asyncio.create_subprocess_shell(
+                    f"tmux has-session -t {shlex.quote(session_name)} 2>/dev/null",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await check_process.wait()
+
+                if check_process.returncode != 0:
+                    # Session ended, command completed
+                    break
+
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+            # Read exit code
+            return_code = 0
+            if exit_code_file.exists():
+                try:
+                    return_code = int(exit_code_file.read_text().strip())
+                except (ValueError, OSError):
+                    return_code = 1
+
+            # Read output files
+            stdout_str = ""
+            stderr_str = ""
+            if stdout_file.exists():
+                stdout_str = stdout_file.read_text()
+            if stderr_file.exists():
+                stderr_str = stderr_file.read_text()
+
+            # Buffer logs for periodic sending to backend
+            if stdout_str:
+                await self._buffer_log(stdout_str, "stdout")
+            if stderr_str:
+                await self._buffer_log(stderr_str, "stderr")
+
+            # Cleanup output files
+            try:
+                if stdout_file.exists():
+                    stdout_file.unlink()
+                if stderr_file.exists():
+                    stderr_file.unlink()
+                if exit_code_file.exists():
+                    exit_code_file.unlink()
+            except OSError:
+                pass  # Ignore cleanup errors
+
+            if return_code == 0:
+                logger.info(f"Command completed successfully in tmux session '{session_name}'")
+                return WorkloadResult(
+                    success=True,
+                    output=stdout_str,
+                    return_code=0,
+                )
+            else:
+                logger.warning(
+                    f"Command failed with code {return_code} in tmux session '{session_name}'"
+                )
+                return WorkloadResult(
+                    success=False,
+                    output=stdout_str,
+                    error=stderr_str or f"Command failed with code {return_code}",
+                    return_code=return_code,
+                )
+
+        except Exception as e:
+            logger.error(f"Error running command in tmux: {e}", exc_info=True)
+            # Fallback to direct execution
+            return await self._run_command_direct(command)
+
+    async def _run_command_direct(self, command: str) -> WorkloadResult:
+        """Run a shell command directly (fallback when tmux is unavailable).
 
         Args:
             command: Shell command to execute
