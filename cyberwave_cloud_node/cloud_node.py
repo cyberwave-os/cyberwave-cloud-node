@@ -546,8 +546,8 @@ class CloudNode:
         logger.info(f"Running install script: {self.config.install_script}")
 
         try:
-            # Install scripts run directly (not in tmux)
-            result = await self._run_command_direct(self.config.install_script)
+            # Install scripts run directly with login shell to ensure conda is available
+            result = await self._run_command(self.config.install_script, workload_type="install")
             if not result.success:
                 raise CloudNodeError(
                     f"Install script failed with code {result.return_code}: {result.error}"
@@ -715,7 +715,7 @@ class CloudNode:
         Args:
             workload_type: Either "inference" or "training"
             params: Parameters to pass to the command
-            request_id: Optional request ID for tmux session naming
+            request_id: Optional request ID for logging
 
         Returns:
             WorkloadResult with output or error
@@ -743,146 +743,90 @@ class CloudNode:
         workload_type: Optional[str] = None,
         request_id: Optional[str] = None,
     ) -> WorkloadResult:
-        """Run a shell command in a tmux session and return the result.
+        """Run a shell command directly and capture output in real-time.
 
         Args:
             command: Shell command to execute
-            workload_type: Optional workload type (inference/training) for tmux session naming
-            request_id: Optional request ID for tmux session naming
+            workload_type: Optional workload type (inference/training) for logging
+            request_id: Optional request ID for logging
 
         Returns:
             WorkloadResult with output and status
         """
-        import time
-
-        # Generate tmux session name
-        if request_id:
-            # Use request_id if available (usually workload UUID)
-            session_name = f"cyberwave-{request_id[:8]}"
-        elif workload_type:
-            # Fallback to workload_type + timestamp
-            timestamp = int(time.time())
-            session_name = f"cyberwave-{workload_type}-{timestamp}"
-        else:
-            # Generic fallback
-            timestamp = int(time.time())
-            session_name = f"cyberwave-{timestamp}"
-
-        # Sanitize session name (tmux session names must be alphanumeric, hyphens, underscores)
-        session_name = "".join(c if c.isalnum() or c in "-_" else "-" for c in session_name)
-        session_name = session_name[:64]  # tmux has a limit on session name length
-
-        # Create output files for capturing stdout/stderr
-        stdout_file = self.working_dir / f".cyberwave-{session_name}.stdout"
-        stderr_file = self.working_dir / f".cyberwave-{session_name}.stderr"
+        logger.info(f"Starting command execution (workload_type: {workload_type}, request_id: {request_id})")
+        logger.info(f"Command: {command}")
 
         try:
-            # Build tmux command to run in detached session
-            # The command redirects stdout/stderr to files and captures exit code
-            exit_code_file = self.working_dir / f".cyberwave-{session_name}.exit"
-            bash_command = (
-                f"{command} > {shlex.quote(str(stdout_file))} "
-                f"2> {shlex.quote(str(stderr_file))}; "
-                f"echo $? > {shlex.quote(str(exit_code_file))}"
-            )
-            tmux_command = (
-                f"tmux new-session -d -s {shlex.quote(session_name)} "
-                f"-c {shlex.quote(str(self.working_dir))} "
-                f"bash -c {shlex.quote(bash_command)}"
-            )
-
-            logger.info(f"Starting tmux session '{session_name}' for command execution")
-            logger.info(f"Attach with: tmux attach -t {session_name}")
-
-            # Create the tmux session
+            # Create subprocess with separate stdout/stderr pipes
+            # Use bash -l (login shell) to ensure conda and other environment variables are properly initialized
+            # This is important if conda was installed by the install script
+            shell_command = f"bash -l -c {shlex.quote(command)}"
             process = await asyncio.create_subprocess_shell(
-                tmux_command,
+                shell_command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=self.working_dir,
             )
 
-            await process.wait()
+            # Collect stdout and stderr in real-time
+            stdout_chunks: list[str] = []
+            stderr_chunks: list[str] = []
 
-            if process.returncode != 0:
-                stderr = (await process.stderr.read()).decode("utf-8") if process.stderr else ""
-                logger.error(f"Failed to create tmux session: {stderr}")
-                # Fallback to direct execution if tmux fails
-                return await self._run_command_direct(command)
+            async def read_stdout() -> None:
+                """Read stdout and buffer logs in real-time."""
+                if process.stdout:
+                    try:
+                        # Read data in chunks to handle both line-buffered and unbuffered output
+                        while True:
+                            # Read up to 8KB at a time
+                            chunk = await process.stdout.read(8192)
+                            if not chunk:
+                                break
+                            chunk_str = chunk.decode("utf-8", errors="replace")
+                            stdout_chunks.append(chunk_str)
+                            # Buffer logs in real-time for backend visualization
+                            await self._buffer_log(chunk_str, "stdout")
+                    except Exception as e:
+                        logger.error(f"Error reading stdout: {e}", exc_info=True)
 
-            # Wait for command to complete (poll tmux session)
-            max_wait_time = 3600 * 24  # 24 hours max
-            poll_interval = 1.0  # Check every second
-            elapsed = 0.0
+            async def read_stderr() -> None:
+                """Read stderr and buffer logs in real-time."""
+                if process.stderr:
+                    try:
+                        # Read data in chunks to handle both line-buffered and unbuffered output
+                        while True:
+                            # Read up to 8KB at a time
+                            chunk = await process.stderr.read(8192)
+                            if not chunk:
+                                break
+                            chunk_str = chunk.decode("utf-8", errors="replace")
+                            stderr_chunks.append(chunk_str)
+                            # Buffer logs in real-time for backend visualization
+                            await self._buffer_log(chunk_str, "stderr")
+                    except Exception as e:
+                        logger.error(f"Error reading stderr: {e}", exc_info=True)
 
-            while elapsed < max_wait_time and self._running:
-                # Check if session still exists (command still running)
-                try:
-                    check_process = await asyncio.create_subprocess_shell(
-                        f"tmux has-session -t {shlex.quote(session_name)} 2>/dev/null",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    await check_process.wait()
+            # Read stdout and stderr concurrently while process runs
+            # This ensures logs are captured in real-time
+            _, _, return_code = await asyncio.gather(
+                read_stdout(),
+                read_stderr(),
+                process.wait(),
+            )
 
-                    if check_process.returncode != 0:
-                        # Session ended, command completed
-                        break
-                except Exception as e:
-                    logger.warning(f"Error checking tmux session status: {e}")
-                    # Continue polling despite error
-
-                # Check if service is shutting down
-                if not self._running:
-                    logger.info("Service shutting down, stopping command execution monitoring")
-                    break
-
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-
-            # Read exit code
-            return_code = 0
-            if exit_code_file.exists():
-                try:
-                    return_code = int(exit_code_file.read_text().strip())
-                except (ValueError, OSError):
-                    return_code = 1
-
-            # Read output files
-            stdout_str = ""
-            stderr_str = ""
-            if stdout_file.exists():
-                stdout_str = stdout_file.read_text()
-            if stderr_file.exists():
-                stderr_str = stderr_file.read_text()
-
-            # Buffer logs for periodic sending to backend
-            if stdout_str:
-                await self._buffer_log(stdout_str, "stdout")
-            if stderr_str:
-                await self._buffer_log(stderr_str, "stderr")
-
-            # Cleanup output files
-            try:
-                if stdout_file.exists():
-                    stdout_file.unlink()
-                if stderr_file.exists():
-                    stderr_file.unlink()
-                if exit_code_file.exists():
-                    exit_code_file.unlink()
-            except OSError:
-                pass  # Ignore cleanup errors
+            # Combine all chunks
+            stdout_str = "".join(stdout_chunks)
+            stderr_str = "".join(stderr_chunks)
 
             if return_code == 0:
-                logger.info(f"Command completed successfully in tmux session '{session_name}'")
+                logger.info(f"Command completed successfully (return_code: {return_code})")
                 return WorkloadResult(
                     success=True,
                     output=stdout_str,
-                    return_code=0,
+                    return_code=return_code,
                 )
             else:
-                logger.warning(
-                    f"Command failed with code {return_code} in tmux session '{session_name}'"
-                )
+                logger.warning(f"Command failed with code {return_code}")
                 return WorkloadResult(
                     success=False,
                     output=stdout_str,
@@ -891,67 +835,11 @@ class CloudNode:
                 )
 
         except Exception as e:
-            logger.error(f"Error running command in tmux: {e}", exc_info=True)
-            # Fallback to direct execution, but wrap in try-except to prevent propagation
-            try:
-                return await self._run_command_direct(command)
-            except Exception as direct_error:
-                logger.error(
-                    f"Error in direct command execution fallback: {direct_error}", exc_info=True
-                )
-                # Return error result instead of raising
-                return WorkloadResult(
-                    success=False,
-                    error=f"Command execution failed: {str(e)}; Fallback also failed: {str(direct_error)}",
-                )
-
-    async def _run_command_direct(self, command: str) -> WorkloadResult:
-        """Run a shell command directly (fallback when tmux is unavailable).
-
-        Args:
-            command: Shell command to execute
-
-        Returns:
-            WorkloadResult with output and status
-        """
-        try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.working_dir,
-            )
-
-            stdout, stderr = await process.communicate()
-            stdout_str = stdout.decode("utf-8") if stdout else ""
-            stderr_str = stderr.decode("utf-8") if stderr else ""
-
-            # Buffer logs for periodic sending to backend
-            if stdout_str:
-                await self._buffer_log(stdout_str, "stdout")
-            if stderr_str:
-                await self._buffer_log(stderr_str, "stderr")
-
-            if process.returncode == 0:
-                return WorkloadResult(
-                    success=True,
-                    output=stdout_str,
-                    return_code=0,
-                )
-            else:
-                return WorkloadResult(
-                    success=False,
-                    output=stdout_str,
-                    error=stderr_str or f"Command failed with code {process.returncode}",
-                    return_code=process.returncode,
-                )
-
-        except Exception as e:
-            # Buffer the error as well
-            await self._buffer_log(str(e), "stderr")
+            logger.error(f"Error running command: {e}", exc_info=True)
+            # Return error result instead of raising
             return WorkloadResult(
                 success=False,
-                error=str(e),
+                error=f"Command execution failed: {str(e)}",
             )
 
     def _setup_signal_handlers(self) -> None:
