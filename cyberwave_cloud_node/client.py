@@ -305,7 +305,7 @@ class CloudNodeClient:
                 endpoint = CLOUD_NODE_REGISTER_ENDPOINT.format(uuid=instance_uuid)
                 response = self._client.post(endpoint, json=payload)
 
-                if response.status_code == 200:
+                if response.status_code < 400:
                     result = RegisterResponse.from_dict(response.json())
 
                     # Save the identity locally for future use
