@@ -549,9 +549,12 @@ class CloudNode:
             # Install scripts run directly with login shell to ensure conda is available
             result = await self._run_command(self.config.install_script, workload_type="install")
             if not result.success:
-                raise CloudNodeError(
-                    f"Install script failed with code {result.return_code}: {result.error}"
-                )
+                error_msg = f"Install script failed with code {result.return_code}"
+                if result.error:
+                    error_msg += f": {result.error}"
+                if result.output:
+                    logger.error(f"Install script stdout: {result.output}")
+                raise CloudNodeError(error_msg)
             logger.info("Install script completed successfully")
 
         except Exception as e:
@@ -827,6 +830,10 @@ class CloudNode:
                 )
             else:
                 logger.warning(f"Command failed with code {return_code}")
+                if stderr_str:
+                    logger.error(f"Command stderr: {stderr_str}")
+                if stdout_str:
+                    logger.info(f"Command stdout: {stdout_str}")
                 return WorkloadResult(
                     success=False,
                     output=stdout_str,
