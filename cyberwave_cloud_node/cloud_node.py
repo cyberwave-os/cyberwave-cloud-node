@@ -97,6 +97,7 @@ class CloudNode:
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._log_flush_task: Optional[asyncio.Task] = None
+        self._mqtt_reconnect_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
 
         # Log buffers for stdout and stderr
@@ -202,6 +203,9 @@ class CloudNode:
             # Step 6: Start log flush loop
             self._log_flush_task = asyncio.create_task(self._log_flush_loop())
 
+            # Step 7: Start MQTT reconnection monitoring loop
+            self._mqtt_reconnect_task = asyncio.create_task(self._mqtt_reconnect_loop())
+
             logger.info(
                 f"Cloud Node '{self.slug}' (uuid: {self.instance_uuid}) is running. "
                 "Waiting for commands via MQTT..."
@@ -246,10 +250,14 @@ class CloudNode:
             mqtt_password=self.config.mqtt_password,
         )
 
-        if not self._cyberwave.mqtt.connected:
-            self._cyberwave.mqtt.connect()
-
-        logger.info("Connected to MQTT broker")
+        try:
+            if not self._cyberwave.mqtt.connected:
+                self._cyberwave.mqtt.connect()
+            logger.info("Connected to MQTT broker")
+        except Exception as e:
+            logger.error(f"Failed to connect to MQTT broker: {e}", exc_info=True)
+            # Raise to allow retry in registration loop
+            raise CloudNodeError(f"MQTT connection failed: {e}") from e
 
     async def _subscribe_to_commands(self) -> None:
         """Subscribe to MQTT topics for receiving workload commands."""
@@ -298,45 +306,62 @@ class CloudNode:
                     future = asyncio.run_coroutine_threadsafe(
                         self._handle_inference(params, request_id), self._event_loop
                     )
+
                     # Add exception handler for the future
                     def handle_future_exception(fut):
                         try:
                             fut.result()  # This will raise if there was an exception
                         except Exception as e:
-                            logger.error(f"Unhandled exception in inference handler: {e}", exc_info=True)
+                            logger.error(
+                                f"Unhandled exception in inference handler: {e}", exc_info=True
+                            )
+
                     future.add_done_callback(handle_future_exception)
                 elif command == "training":
                     future = asyncio.run_coroutine_threadsafe(
                         self._handle_training(params, request_id), self._event_loop
                     )
+
                     # Add exception handler for the future
                     def handle_future_exception(fut):
                         try:
                             fut.result()  # This will raise if there was an exception
                         except Exception as e:
-                            logger.error(f"Unhandled exception in training handler: {e}", exc_info=True)
+                            logger.error(
+                                f"Unhandled exception in training handler: {e}", exc_info=True
+                            )
+
                     future.add_done_callback(handle_future_exception)
                 elif command == "status":
                     future = asyncio.run_coroutine_threadsafe(
                         self._handle_status(request_id), self._event_loop
                     )
+
                     # Add exception handler for the future
                     def handle_future_exception(fut):
                         try:
                             fut.result()
                         except Exception as e:
-                            logger.error(f"Unhandled exception in status handler: {e}", exc_info=True)
+                            logger.error(
+                                f"Unhandled exception in status handler: {e}", exc_info=True
+                            )
+
                     future.add_done_callback(handle_future_exception)
                 elif command == "workload_received":
                     future = asyncio.run_coroutine_threadsafe(
                         self._handle_workload_received(params, request_id), self._event_loop
                     )
+
                     # Add exception handler for the future
                     def handle_future_exception(fut):
                         try:
                             fut.result()
                         except Exception as e:
-                            logger.error(f"Unhandled exception in workload_received handler: {e}", exc_info=True)
+                            logger.error(
+                                f"Unhandled exception in workload_received handler: {e}",
+                                exc_info=True,
+                            )
+
                     future.add_done_callback(handle_future_exception)
                 else:
                     logger.warning(f"Unknown command: {command}")
@@ -350,8 +375,12 @@ class CloudNode:
         # Subscribe to cloud-node command topic
         # Topic pattern: cyberwave/cloud-node/{instance_uuid}/command
         topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/command"
-        self._cyberwave.mqtt.subscribe(topic, on_command)
-        logger.info(f"Subscribed to command topic: {topic}")
+        try:
+            self._cyberwave.mqtt.subscribe(topic, on_command)
+            logger.info(f"Subscribed to command topic: {topic}")
+        except Exception as e:
+            logger.error(f"Failed to subscribe to MQTT topic {topic}: {e}", exc_info=True)
+            raise CloudNodeError(f"Failed to subscribe to command topic: {e}") from e
 
     def _publish_response(
         self,
@@ -397,12 +426,12 @@ class CloudNode:
 
             logger.info(f"Starting inference workload (request_id: {request_id})")
             result = await self.execute_workload("inference", params, request_id=request_id)
-            
+
             logger.info(
                 f"Inference workload completed (request_id: {request_id}, "
                 f"success: {result.success})"
             )
-            
+
             self._publish_response(
                 request_id,
                 success=result.success,
@@ -411,8 +440,7 @@ class CloudNode:
             )
         except Exception as e:
             logger.error(
-                f"Error handling inference command (request_id: {request_id}): {e}",
-                exc_info=True
+                f"Error handling inference command (request_id: {request_id}): {e}", exc_info=True
             )
             # Try to publish error response
             try:
@@ -438,12 +466,11 @@ class CloudNode:
 
             logger.info(f"Starting training workload (request_id: {request_id})")
             result = await self.execute_workload("training", params, request_id=request_id)
-            
+
             logger.info(
-                f"Training workload completed (request_id: {request_id}, "
-                f"success: {result.success})"
+                f"Training workload completed (request_id: {request_id}, success: {result.success})"
             )
-            
+
             self._publish_response(
                 request_id,
                 success=result.success,
@@ -452,8 +479,7 @@ class CloudNode:
             )
         except Exception as e:
             logger.error(
-                f"Error handling training command (request_id: {request_id}): {e}",
-                exc_info=True
+                f"Error handling training command (request_id: {request_id}): {e}", exc_info=True
             )
             # Try to publish error response
             try:
@@ -482,9 +508,7 @@ class CloudNode:
             ),
         )
 
-    async def _handle_workload_received(
-        self, params: dict, request_id: Optional[str]
-    ) -> None:
+    async def _handle_workload_received(self, params: dict, request_id: Optional[str]) -> None:
         """Handle a workload_received notification.
 
         This is called when a workload is assigned to this instance.
@@ -578,9 +602,7 @@ class CloudNode:
 
         while self._running:
             try:
-                response = self.client.heartbeat(
-                    slug=self.slug, instance_uuid=self.instance_uuid
-                )
+                response = self.client.heartbeat(slug=self.slug, instance_uuid=self.instance_uuid)
                 logger.debug(f"Heartbeat sent: {response.message}")
 
             except CloudNodeClientError as e:
@@ -596,6 +618,34 @@ class CloudNode:
         while self._running:
             await asyncio.sleep(self._log_flush_interval)
             await self._flush_logs()
+
+    async def _mqtt_reconnect_loop(self) -> None:
+        """Monitor MQTT connection and reconnect if needed."""
+        logger.info("Starting MQTT reconnection monitoring loop")
+        check_interval = 30  # Check every 30 seconds
+
+        while self._running:
+            await asyncio.sleep(check_interval)
+
+            try:
+                # Check if MQTT is connected
+                if self._cyberwave and self._cyberwave.mqtt:
+                    if not self._cyberwave.mqtt.connected:
+                        logger.warning("MQTT connection lost, attempting to reconnect...")
+                        try:
+                            self._cyberwave.mqtt.connect()
+                            logger.info("MQTT reconnected successfully")
+                            # Re-subscribe to command topics after reconnection
+                            if self.instance_uuid:
+                                await self._subscribe_to_commands()
+                        except Exception as reconnect_error:
+                            logger.error(
+                                f"Failed to reconnect to MQTT: {reconnect_error}", exc_info=True
+                            )
+                            # Continue monitoring - will retry on next check
+            except Exception as e:
+                logger.error(f"Error checking MQTT connection status: {e}", exc_info=True)
+                # Don't crash - continue monitoring
 
     async def _flush_logs(self) -> None:
         """Flush buffered logs to the backend."""
@@ -780,7 +830,7 @@ class CloudNode:
                 except Exception as e:
                     logger.warning(f"Error checking tmux session status: {e}")
                     # Continue polling despite error
-                
+
                 # Check if service is shutting down
                 if not self._running:
                     logger.info("Service shutting down, stopping command execution monitoring")
@@ -846,7 +896,9 @@ class CloudNode:
             try:
                 return await self._run_command_direct(command)
             except Exception as direct_error:
-                logger.error(f"Error in direct command execution fallback: {direct_error}", exc_info=True)
+                logger.error(
+                    f"Error in direct command execution fallback: {direct_error}", exc_info=True
+                )
                 # Return error result instead of raising
                 return WorkloadResult(
                     success=False,
@@ -945,6 +997,13 @@ class CloudNode:
             self._log_flush_task.cancel()
             try:
                 await self._log_flush_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._mqtt_reconnect_task:
+            self._mqtt_reconnect_task.cancel()
+            try:
+                await self._mqtt_reconnect_task
             except asyncio.CancelledError:
                 pass
 
