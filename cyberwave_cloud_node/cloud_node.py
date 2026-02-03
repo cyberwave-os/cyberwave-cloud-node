@@ -210,13 +210,22 @@ class CloudNode:
             # Wait for shutdown signal
             await self._shutdown_event.wait()
 
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down gracefully")
+            # Don't mark as failed for keyboard interrupt
         except Exception as e:
-            logger.error(f"Cloud Node error: {e}")
-            await self._notify_failed(str(e))
-            raise
+            logger.error(f"Cloud Node error: {e}", exc_info=True)
+            try:
+                await self._notify_failed(str(e))
+            except Exception as notify_error:
+                logger.error(f"Failed to notify backend of failure: {notify_error}")
+            # Don't re-raise - let shutdown happen gracefully
 
         finally:
-            await self._shutdown()
+            try:
+                await self._shutdown()
+            except Exception as shutdown_error:
+                logger.error(f"Error during shutdown: {shutdown_error}", exc_info=True)
 
     async def _connect_mqtt(self) -> None:
         """Connect to the MQTT broker using the Cyberwave SDK."""
@@ -286,21 +295,49 @@ class CloudNode:
                     logger.error(f"Failed to publish command received response: {e}")
 
                 if command == "inference":
-                    asyncio.run_coroutine_threadsafe(
+                    future = asyncio.run_coroutine_threadsafe(
                         self._handle_inference(params, request_id), self._event_loop
                     )
+                    # Add exception handler for the future
+                    def handle_future_exception(fut):
+                        try:
+                            fut.result()  # This will raise if there was an exception
+                        except Exception as e:
+                            logger.error(f"Unhandled exception in inference handler: {e}", exc_info=True)
+                    future.add_done_callback(handle_future_exception)
                 elif command == "training":
-                    asyncio.run_coroutine_threadsafe(
+                    future = asyncio.run_coroutine_threadsafe(
                         self._handle_training(params, request_id), self._event_loop
                     )
+                    # Add exception handler for the future
+                    def handle_future_exception(fut):
+                        try:
+                            fut.result()  # This will raise if there was an exception
+                        except Exception as e:
+                            logger.error(f"Unhandled exception in training handler: {e}", exc_info=True)
+                    future.add_done_callback(handle_future_exception)
                 elif command == "status":
-                    asyncio.run_coroutine_threadsafe(
+                    future = asyncio.run_coroutine_threadsafe(
                         self._handle_status(request_id), self._event_loop
                     )
+                    # Add exception handler for the future
+                    def handle_future_exception(fut):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            logger.error(f"Unhandled exception in status handler: {e}", exc_info=True)
+                    future.add_done_callback(handle_future_exception)
                 elif command == "workload_received":
-                    asyncio.run_coroutine_threadsafe(
+                    future = asyncio.run_coroutine_threadsafe(
                         self._handle_workload_received(params, request_id), self._event_loop
                     )
+                    # Add exception handler for the future
+                    def handle_future_exception(fut):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            logger.error(f"Unhandled exception in workload_received handler: {e}", exc_info=True)
+                    future.add_done_callback(handle_future_exception)
                 else:
                     logger.warning(f"Unknown command: {command}")
                     self._publish_response(
@@ -727,17 +764,26 @@ class CloudNode:
             poll_interval = 1.0  # Check every second
             elapsed = 0.0
 
-            while elapsed < max_wait_time:
+            while elapsed < max_wait_time and self._running:
                 # Check if session still exists (command still running)
-                check_process = await asyncio.create_subprocess_shell(
-                    f"tmux has-session -t {shlex.quote(session_name)} 2>/dev/null",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await check_process.wait()
+                try:
+                    check_process = await asyncio.create_subprocess_shell(
+                        f"tmux has-session -t {shlex.quote(session_name)} 2>/dev/null",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await check_process.wait()
 
-                if check_process.returncode != 0:
-                    # Session ended, command completed
+                    if check_process.returncode != 0:
+                        # Session ended, command completed
+                        break
+                except Exception as e:
+                    logger.warning(f"Error checking tmux session status: {e}")
+                    # Continue polling despite error
+                
+                # Check if service is shutting down
+                if not self._running:
+                    logger.info("Service shutting down, stopping command execution monitoring")
                     break
 
                 await asyncio.sleep(poll_interval)
@@ -796,8 +842,16 @@ class CloudNode:
 
         except Exception as e:
             logger.error(f"Error running command in tmux: {e}", exc_info=True)
-            # Fallback to direct execution
-            return await self._run_command_direct(command)
+            # Fallback to direct execution, but wrap in try-except to prevent propagation
+            try:
+                return await self._run_command_direct(command)
+            except Exception as direct_error:
+                logger.error(f"Error in direct command execution fallback: {direct_error}", exc_info=True)
+                # Return error result instead of raising
+                return WorkloadResult(
+                    success=False,
+                    error=f"Command execution failed: {str(e)}; Fallback also failed: {str(direct_error)}",
+                )
 
     async def _run_command_direct(self, command: str) -> WorkloadResult:
         """Run a shell command directly (fallback when tmux is unavailable).
@@ -855,7 +909,13 @@ class CloudNode:
             logger.info(f"Received signal {signum}, initiating shutdown...")
             self._running = False
             # Set the event in a thread-safe way
-            asyncio.get_event_loop().call_soon_threadsafe(self._shutdown_event.set)
+            # Use the stored event loop if available, otherwise get the current one
+            loop = self._event_loop if self._event_loop else asyncio.get_event_loop()
+            if loop and not loop.is_closed():
+                loop.call_soon_threadsafe(self._shutdown_event.set)
+            else:
+                # Fallback: set the event directly if loop is not available
+                self._shutdown_event.set()
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
