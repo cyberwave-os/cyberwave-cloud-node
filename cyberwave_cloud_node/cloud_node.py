@@ -349,39 +349,85 @@ class CloudNode:
 
     async def _handle_inference(self, params: dict, request_id: Optional[str]) -> None:
         """Handle an inference command."""
-        if not self.config.inference:
+        try:
+            if not self.config.inference:
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error="Inference command not configured in cyberwave.yml",
+                )
+                return
+
+            logger.info(f"Starting inference workload (request_id: {request_id})")
+            result = await self.execute_workload("inference", params, request_id=request_id)
+            
+            logger.info(
+                f"Inference workload completed (request_id: {request_id}, "
+                f"success: {result.success})"
+            )
+            
             self._publish_response(
                 request_id,
-                success=False,
-                error="Inference command not configured in cyberwave.yml",
+                success=result.success,
+                output=result.output,
+                error=result.error,
             )
-            return
-
-        result = await self.execute_workload("inference", params, request_id=request_id)
-        self._publish_response(
-            request_id,
-            success=result.success,
-            output=result.output,
-            error=result.error,
-        )
+        except Exception as e:
+            logger.error(
+                f"Error handling inference command (request_id: {request_id}): {e}",
+                exc_info=True
+            )
+            # Try to publish error response
+            try:
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error=f"Inference command failed: {str(e)}",
+                )
+            except Exception as pub_error:
+                logger.error(f"Failed to publish error response: {pub_error}")
+            # Don't re-raise - we don't want to crash the service
 
     async def _handle_training(self, params: dict, request_id: Optional[str]) -> None:
         """Handle a training command."""
-        if not self.config.training:
+        try:
+            if not self.config.training:
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error="Training command not configured in cyberwave.yml",
+                )
+                return
+
+            logger.info(f"Starting training workload (request_id: {request_id})")
+            result = await self.execute_workload("training", params, request_id=request_id)
+            
+            logger.info(
+                f"Training workload completed (request_id: {request_id}, "
+                f"success: {result.success})"
+            )
+            
             self._publish_response(
                 request_id,
-                success=False,
-                error="Training command not configured in cyberwave.yml",
+                success=result.success,
+                output=result.output,
+                error=result.error,
             )
-            return
-
-        result = await self.execute_workload("training", params, request_id=request_id)
-        self._publish_response(
-            request_id,
-            success=result.success,
-            output=result.output,
-            error=result.error,
-        )
+        except Exception as e:
+            logger.error(
+                f"Error handling training command (request_id: {request_id}): {e}",
+                exc_info=True
+            )
+            # Try to publish error response
+            try:
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error=f"Training command failed: {str(e)}",
+                )
+            except Exception as pub_error:
+                logger.error(f"Failed to publish error response: {pub_error}")
+            # Don't re-raise - we don't want to crash the service
 
     async def _handle_status(self, request_id: Optional[str]) -> None:
         """Handle a status query."""
