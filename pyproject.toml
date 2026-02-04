@@ -26,6 +26,7 @@ dependencies = [
     "pyyaml>=6.0",
     "python-dotenv>=1.0.0",
     "cyberwave>=0.2.26",
+    "sentry-sdk>=2.0.0",
 ]
 
 [project.optional-dependencies]

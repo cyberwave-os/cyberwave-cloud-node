@@ -761,9 +761,8 @@ class CloudNode:
 
         try:
             # Create subprocess with separate stdout/stderr pipes
-            # Use bash -l (login shell) to ensure conda and other environment variables are properly initialized
-            # This is important if conda was installed by the install script
-            shell_command = f"bash -l -c {shlex.quote(command)}"
+            # Use bash to ensure proper shell expansion and environment variable handling
+            shell_command = f"bash -c {shlex.quote(command)}"
             process = await asyncio.create_subprocess_shell(
                 shell_command,
                 stdout=asyncio.subprocess.PIPE,

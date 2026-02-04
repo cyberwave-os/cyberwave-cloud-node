@@ -8,12 +8,47 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 from importlib.metadata import version
 from pathlib import Path
 
 from .cloud_node import CloudNode, CloudNodeError
 from .config import CloudNodeConfig, get_api_token, get_instance_slug, load_dotenv_files
+
+
+def init_sentry() -> None:
+    """Initialize Sentry SDK if DSN is provided."""
+    sentry_dsn = os.environ.get("SENTRY_DSN")
+    if sentry_dsn:
+        import sentry_sdk
+
+        logger = logging.getLogger("cyberwave-cloud-node")
+        logger.info("Initializing Sentry SDK...")
+
+        sentry_sdk.init(
+            dsn=sentry_dsn,
+            enable_logs=True,
+            # Set traces_sample_rate to 1.0 to capture 100%
+            # of the transactions for performance monitoring.
+            # We recommend adjusting this value in production.
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "1.0")),
+            # Set profiles_sample_rate to profile 100% of sampled transactions.
+            # We recommend adjusting this value in production.
+            profiles_sample_rate=float(
+                os.environ.get("SENTRY_PROFILES_SAMPLE_RATE", "1.0")
+            ),
+            environment=os.environ.get("ENVIRONMENT", "local"),
+            profile_session_sample_rate=float(
+                os.environ.get("SENTRY_PROFILE_SESSION_SAMPLE_RATE", "1.0")
+            ),
+            release=os.environ.get("SENTRY_RELEASE"),
+            profile_lifecycle="trace",
+        )
+        logger.info("Sentry SDK initialized successfully")
+    else:
+        logger = logging.getLogger("cyberwave-cloud-node")
+        logger.debug("Sentry DSN not set, skipping Sentry initialization")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -28,6 +63,9 @@ def setup_logging(verbose: bool = False) -> None:
 
 def main() -> int:
     """Main entry point for the CLI."""
+    # Initialize Sentry early, before any other operations
+    init_sentry()
+
     parser = argparse.ArgumentParser(
         prog="cyberwave-cloud-node",
         description="Turn any computer into a Cyberwave Cloud Node for inference and training",
