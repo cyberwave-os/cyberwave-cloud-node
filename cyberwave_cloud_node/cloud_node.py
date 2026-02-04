@@ -5,19 +5,26 @@ This module provides the CloudNode class that orchestrates:
 - Registering with the Cyberwave backend
 - Connecting to MQTT to receive workload commands
 - Sending periodic heartbeats
-- Processing inference and training workloads
-- Handling graceful shutdown
+- Processing inference and training workloads as independent OS processes
+- Handling graceful shutdown without interrupting running workloads
+
+Workloads (inference/training) run as detached subprocesses that survive
+Cloud Node restarts. The node tracks process IDs to determine capacity
+and collect results when workloads complete.
 """
 
 import asyncio
 import json
 import logging
 import os
+import psutil
 import shlex
 import signal
-from dataclasses import dataclass
+import subprocess
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from cyberwave import Cyberwave  # type: ignore[import-untyped]
 
@@ -41,6 +48,20 @@ class WorkloadResult:
     output: Optional[str] = None
     error: Optional[str] = None
     return_code: Optional[int] = None
+
+
+@dataclass
+class ActiveWorkload:
+    """Represents an active workload running as an OS process."""
+
+    pid: int
+    request_id: Optional[str]
+    workload_type: str  # "inference" or "training"
+    started_at: float
+    command: str
+    stdout_file: Path
+    stderr_file: Path
+    params: Dict[str, Any] = field(default_factory=dict)
 
 
 class CloudNode:
@@ -98,9 +119,18 @@ class CloudNode:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._log_flush_task: Optional[asyncio.Task] = None
         self._mqtt_reconnect_task: Optional[asyncio.Task] = None
+        self._workload_monitor_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
 
-        # Log buffers for stdout and stderr
+        # Track active workloads by PID (process-based, survives restarts)
+        self._active_workloads: Dict[int, ActiveWorkload] = {}
+        self._workload_lock = asyncio.Lock()
+
+        # Directory for workload output files
+        self._workload_output_dir = Path.home() / ".cyberwave" / "workload_logs"
+        self._workload_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Log buffers for cloud node itself (not workload output)
         self._stdout_buffer: list[str] = []
         self._stderr_buffer: list[str] = []
         self._log_buffer_lock = asyncio.Lock()
@@ -197,14 +227,11 @@ class CloudNode:
             # Step 4: Subscribe to command topics
             await self._subscribe_to_commands()
 
-            # Step 5: Start heartbeat loop (only after registration and UUID is set)
+            # Step 5: Start background monitoring loops
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-            # Step 6: Start log flush loop
             self._log_flush_task = asyncio.create_task(self._log_flush_loop())
-
-            # Step 7: Start MQTT reconnection monitoring loop
             self._mqtt_reconnect_task = asyncio.create_task(self._mqtt_reconnect_loop())
+            self._workload_monitor_task = asyncio.create_task(self._workload_monitor_loop())
 
             logger.info(
                 f"Cloud Node '{self.slug}' (uuid: {self.instance_uuid}) is running. "
@@ -281,94 +308,65 @@ class CloudNode:
                     logger.warning("Command message missing 'command' field")
                     return
 
+                # Reject new commands during shutdown
+                if not self._running:
+                    logger.warning(
+                        f"Rejecting command {command} (request_id: {request_id}) - "
+                        "node is shutting down"
+                    )
+                    self._publish_response(
+                        request_id,
+                        success=False,
+                        error="Cloud node is shutting down and not accepting new commands",
+                    )
+                    return
+
                 logger.info(f"Received command: {command} (request_id: {request_id})")
 
                 if self._event_loop is None:
                     logger.error("Event loop not available")
                     return
 
-                try:
-                    msg = {}
-                    msg["command"] = command
-                    msg["request_id"] = request_id
-                    msg["received"] = "true"
-                    topic = (
-                        f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/telemetry"
-                    )
-                    # TODO: reinstate telemetry
-                    if self._cyberwave and self._cyberwave.mqtt and self._cyberwave.mqtt._client:
-                        self._cyberwave.mqtt._client.publish(topic, msg)
-                    logger.debug(f"Published command received response to {topic}")
-                except Exception as e:
-                    logger.error(f"Failed to publish command received response: {e}")
-
-                if command == "inference":
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._handle_inference(params, request_id), self._event_loop
-                    )
-
-                    # Add exception handler for the future
-                    def handle_future_exception(fut):
-                        try:
-                            fut.result()  # This will raise if there was an exception
-                        except Exception as e:
-                            logger.error(
-                                f"Unhandled exception in inference handler: {e}", exc_info=True
+                match command:
+                    case "inference":
+                        if self._event_loop:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_inference(params, request_id), self._event_loop
                             )
-
-                    future.add_done_callback(handle_future_exception)
-                elif command == "training":
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._handle_training(params, request_id), self._event_loop
-                    )
-
-                    # Add exception handler for the future
-                    def handle_future_exception(fut):
-                        try:
-                            fut.result()  # This will raise if there was an exception
-                        except Exception as e:
-                            logger.error(
-                                f"Unhandled exception in training handler: {e}", exc_info=True
+                    case "training":
+                        if self._event_loop:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_training(params, request_id), self._event_loop
                             )
-
-                    future.add_done_callback(handle_future_exception)
-                elif command == "status":
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._handle_status(request_id), self._event_loop
-                    )
-
-                    # Add exception handler for the future
-                    def handle_future_exception(fut):
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            logger.error(
-                                f"Unhandled exception in status handler: {e}", exc_info=True
+                    case "status":
+                        if self._event_loop:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_status(request_id), self._event_loop
                             )
-
-                    future.add_done_callback(handle_future_exception)
-                elif command == "workload_received":
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._handle_workload_received(params, request_id), self._event_loop
-                    )
-
-                    # Add exception handler for the future
-                    def handle_future_exception(fut):
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            logger.error(
-                                f"Unhandled exception in workload_received handler: {e}",
-                                exc_info=True,
+                    case "workload_received":
+                        if self._event_loop:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_workload_received(params, request_id), self._event_loop
                             )
+                    case "cancel":
+                        if self._event_loop:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_cancel(params, request_id), self._event_loop
+                            )
+                    case _:
+                        logger.warning(f"Unknown command: {command}")
+                        self._publish_response(
+                            request_id, success=False, error=f"Unknown command: {command}"
+                        )
 
-                    future.add_done_callback(handle_future_exception)
-                else:
-                    logger.warning(f"Unknown command: {command}")
-                    self._publish_response(
-                        request_id, success=False, error=f"Unknown command: {command}"
-                    )
-
+                self._publish_message(
+                    "telemetry",
+                    {
+                        "command": command,
+                        "request_id": request_id,
+                        "received": "true",
+                    },
+                )
             except Exception as e:
                 logger.error(f"Error processing command: {e}", exc_info=True)
 
@@ -382,6 +380,18 @@ class CloudNode:
             logger.error(f"Failed to subscribe to MQTT topic {topic}: {e}", exc_info=True)
             raise CloudNodeError(f"Failed to subscribe to command topic: {e}") from e
 
+    def _publish_message(self, topic_type: str, message: dict) -> None:
+        """Publish a message to an MQTT topic."""
+        if not self._cyberwave:
+            return
+        topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/{topic_type}"
+        try:
+            self._cyberwave.mqtt._client.publish(topic, message)
+            logger.debug(f"Published message to topic: {topic}")
+        except Exception as e:
+            logger.error(f"Failed to publish message to {topic}: {e}")
+            raise CloudNodeError(f"Failed to publish message to {topic}: {e}") from e
+
     def _publish_response(
         self,
         request_id: Optional[str],
@@ -390,8 +400,6 @@ class CloudNode:
         error: Optional[str] = None,
     ) -> None:
         """Publish a response message back via MQTT."""
-        if not self._cyberwave:
-            return
 
         response = {
             "status": "ok" if success else "error",
@@ -405,16 +413,18 @@ class CloudNode:
         if error is not None:
             response["error"] = error
 
-        # Publish to response topic
-        topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/response"
-        try:
-            self._cyberwave.mqtt._client.publish(topic, response)
-            logger.debug(f"Published response to {topic}")
-        except Exception as e:
-            logger.error(f"Failed to publish response: {e}")
+        self._publish_message("response", response)
+
+    def _is_node_busy(self) -> bool:
+        """Check if the node is currently running any workloads."""
+        return len(self._active_workloads) > 0
+
+    def _get_active_workload_count(self) -> int:
+        """Get count of active workloads."""
+        return len(self._active_workloads)
 
     async def _handle_inference(self, params: dict, request_id: Optional[str]) -> None:
-        """Handle an inference command."""
+        """Handle an inference command by spawning a detached process."""
         try:
             if not self.config.inference:
                 self._publish_response(
@@ -424,37 +434,34 @@ class CloudNode:
                 )
                 return
 
-            logger.info(f"Starting inference workload (request_id: {request_id})")
-            result = await self.execute_workload("inference", params, request_id=request_id)
-
-            logger.info(
-                f"Inference workload completed (request_id: {request_id}, "
-                f"success: {result.success})"
-            )
-
-            self._publish_response(
-                request_id,
-                success=result.success,
-                output=result.output,
-                error=result.error,
-            )
-        except Exception as e:
-            logger.error(
-                f"Error handling inference command (request_id: {request_id}): {e}", exc_info=True
-            )
-            # Try to publish error response
-            try:
+            # Check if node is busy (optional: could support multiple concurrent workloads)
+            if self._is_node_busy():
+                logger.warning(
+                    f"Node is busy with {self._get_active_workload_count()} active workload(s). "
+                    f"Rejecting inference request {request_id}"
+                )
                 self._publish_response(
                     request_id,
                     success=False,
-                    error=f"Inference command failed: {str(e)}",
+                    error=f"Node is busy with {self._get_active_workload_count()} active workload(s)",
                 )
-            except Exception as pub_error:
-                logger.error(f"Failed to publish error response: {pub_error}")
-            # Don't re-raise - we don't want to crash the service
+                return
+
+            logger.info(f"Starting inference workload (request_id: {request_id})")
+            await self._spawn_workload_process("inference", params, request_id)
+
+        except Exception as e:
+            logger.error(
+                f"Error starting inference command (request_id: {request_id}): {e}", exc_info=True
+            )
+            self._publish_response(
+                request_id,
+                success=False,
+                error=f"Failed to start inference: {str(e)}",
+            )
 
     async def _handle_training(self, params: dict, request_id: Optional[str]) -> None:
-        """Handle a training command."""
+        """Handle a training command by spawning a detached process."""
         try:
             if not self.config.training:
                 self._publish_response(
@@ -464,36 +471,45 @@ class CloudNode:
                 )
                 return
 
-            logger.info(f"Starting training workload (request_id: {request_id})")
-            result = await self.execute_workload("training", params, request_id=request_id)
-
-            logger.info(
-                f"Training workload completed (request_id: {request_id}, success: {result.success})"
-            )
-
-            self._publish_response(
-                request_id,
-                success=result.success,
-                output=result.output,
-                error=result.error,
-            )
-        except Exception as e:
-            logger.error(
-                f"Error handling training command (request_id: {request_id}): {e}", exc_info=True
-            )
-            # Try to publish error response
-            try:
+            # Check if node is busy (optional: could support multiple concurrent workloads)
+            if self._is_node_busy():
+                logger.warning(
+                    f"Node is busy with {self._get_active_workload_count()} active workload(s). "
+                    f"Rejecting training request {request_id}"
+                )
                 self._publish_response(
                     request_id,
                     success=False,
-                    error=f"Training command failed: {str(e)}",
+                    error=f"Node is busy with {self._get_active_workload_count()} active workload(s)",  # noqa: E501
                 )
-            except Exception as pub_error:
-                logger.error(f"Failed to publish error response: {pub_error}")
-            # Don't re-raise - we don't want to crash the service
+                return
+
+            logger.info(f"Starting training workload (request_id: {request_id})")
+            await self._spawn_workload_process("training", params, request_id)
+
+        except Exception as e:
+            logger.error(
+                f"Error starting training command (request_id: {request_id}): {e}", exc_info=True
+            )
+            self._publish_response(
+                request_id,
+                success=False,
+                error=f"Failed to start training: {str(e)}",
+            )
 
     async def _handle_status(self, request_id: Optional[str]) -> None:
         """Handle a status query."""
+        async with self._workload_lock:
+            active_workloads_info = [
+                {
+                    "pid": w.pid,
+                    "type": w.workload_type,
+                    "request_id": w.request_id,
+                    "running_for_seconds": int(time.time() - w.started_at),
+                }
+                for w in self._active_workloads.values()
+            ]
+
         self._publish_response(
             request_id,
             success=True,
@@ -504,6 +520,8 @@ class CloudNode:
                     "profile_slug": self.config.profile_slug,
                     "has_inference": bool(self.config.inference),
                     "has_training": bool(self.config.training),
+                    "is_busy": self._is_node_busy(),
+                    "active_workloads": active_workloads_info,
                 }
             ),
         )
@@ -525,18 +543,177 @@ class CloudNode:
         )
 
         # If there's a command_type, execute it
-        if command_type == "inference":
-            await self._handle_inference(command_params, request_id)
-        elif command_type == "training":
-            await self._handle_training(command_params, request_id)
-        else:
-            # No specific command type - just acknowledge receipt
-            logger.info(f"Workload {workload_uuid} received (no command_type specified)")
+        match command_type:
+            case "inference":
+                await self._handle_inference(command_params, request_id)
+            case "training":
+                await self._handle_training(command_params, request_id)
+            case _:
+                # No specific command type - just acknowledge receipt
+                logger.info(f"Workload {workload_uuid} received (no command_type specified)")
+                self._publish_response(
+                    request_id,
+                    success=True,
+                    output=f"Workload {workload_uuid} received and acknowledged",
+                )
+
+    async def _handle_cancel(self, params: dict, request_id: Optional[str]) -> None:
+        """Handle a cancel command to terminate a running workload.
+
+        Params can include:
+        - pid: Process ID to cancel (direct)
+        - workload_request_id: Request ID of the workload to cancel
+        - signal: Signal to send (default: SIGTERM, options: SIGTERM, SIGKILL)
+
+        Examples:
+            {"pid": 12345}
+            {"workload_request_id": "abc-123"}
+            {"pid": 12345, "signal": "SIGKILL"}
+        """
+        try:
+            target_pid = params.get("pid")
+            target_request_id = params.get("workload_request_id")
+            signal_name = params.get("signal", "SIGTERM")
+
+            # Validate signal
+            if signal_name not in ["SIGTERM", "SIGKILL", "SIGINT"]:
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error=f"Invalid signal: {signal_name}. Must be SIGTERM, SIGKILL, or SIGINT",
+                )
+                return
+
+            # Find the workload to cancel
+            workload = None
+            async with self._workload_lock:
+                if target_pid:
+                    workload = self._active_workloads.get(target_pid)
+                elif target_request_id:
+                    # Find by request_id
+                    for w in self._active_workloads.values():
+                        if w.request_id == target_request_id:
+                            workload = w
+                            break
+
+            if not workload:
+                error_msg = "No active workload found"
+                if target_pid:
+                    error_msg += f" with PID {target_pid}"
+                if target_request_id:
+                    error_msg += f" with request_id {target_request_id}"
+
+                logger.warning(error_msg)
+                self._publish_response(request_id, success=False, error=error_msg)
+                return
+
+            # Cancel the workload
+            success, message = await self._cancel_workload(workload, signal_name)
+
+            if success:
+                logger.info(
+                    f"Successfully cancelled workload PID {workload.pid} "
+                    f"({workload.workload_type}, request_id: {workload.request_id})"
+                )
+                self._publish_response(
+                    request_id,
+                    success=True,
+                    output=json.dumps(
+                        {
+                            "message": message,
+                            "pid": workload.pid,
+                            "workload_type": workload.workload_type,
+                            "workload_request_id": workload.request_id,
+                            "signal": signal_name,
+                        }
+                    ),
+                )
+            else:
+                logger.error(f"Failed to cancel workload PID {workload.pid}: {message}")
+                self._publish_response(request_id, success=False, error=message)
+
+        except Exception as e:
+            logger.error(f"Error handling cancel command: {e}", exc_info=True)
             self._publish_response(
                 request_id,
-                success=True,
-                output=f"Workload {workload_uuid} received and acknowledged",
+                success=False,
+                error=f"Failed to cancel workload: {str(e)}",
             )
+
+    async def _cancel_workload(
+        self, workload: ActiveWorkload, signal_name: str = "SIGTERM"
+    ) -> tuple[bool, str]:
+        """Cancel a running workload by sending a signal to its process.
+
+        Args:
+            workload: The ActiveWorkload to cancel
+            signal_name: Signal to send (SIGTERM, SIGKILL, SIGINT)
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        try:
+            # Check if process is still alive
+            if not self._is_process_alive(workload.pid):
+                # Already dead, clean up
+                async with self._workload_lock:
+                    self._active_workloads.pop(workload.pid, None)
+                return True, f"Process {workload.pid} was already terminated"
+
+            # Get the process
+            process = psutil.Process(workload.pid)
+
+            # Send the signal
+            signal_map = {
+                "SIGTERM": signal.SIGTERM,
+                "SIGKILL": signal.SIGKILL,
+                "SIGINT": signal.SIGINT,
+            }
+            sig = signal_map[signal_name]
+
+            logger.info(
+                f"Sending {signal_name} to workload PID {workload.pid} ({workload.workload_type})"
+            )
+            process.send_signal(sig)
+
+            # For SIGKILL, wait briefly to confirm termination
+            if signal_name == "SIGKILL":
+                try:
+                    process.wait(timeout=2)
+                except psutil.TimeoutExpired:
+                    return False, f"Process {workload.pid} did not terminate after SIGKILL"
+
+            # Remove from active workloads
+            async with self._workload_lock:
+                self._active_workloads.pop(workload.pid, None)
+
+            # Publish cancellation notification to the workload's original request
+            self._publish_response(
+                workload.request_id,
+                success=False,
+                error=f"Workload cancelled by {signal_name}",
+                output=json.dumps(
+                    {
+                        "status": "cancelled",
+                        "signal": signal_name,
+                        "pid": workload.pid,
+                    }
+                ),
+            )
+
+            return True, f"Workload cancelled with {signal_name}"
+
+        except psutil.NoSuchProcess:
+            # Process already gone
+            async with self._workload_lock:
+                self._active_workloads.pop(workload.pid, None)
+            return True, f"Process {workload.pid} no longer exists"
+
+        except psutil.AccessDenied:
+            return False, f"Permission denied to send signal to process {workload.pid}"
+
+        except Exception as e:
+            return False, f"Failed to cancel workload: {str(e)}"
 
     async def _run_install_script(self) -> None:
         """Run the install script from cyberwave.yml."""
@@ -560,6 +737,211 @@ class CloudNode:
         except Exception as e:
             logger.error(f"Install script failed: {e}")
             raise CloudNodeError(f"Install script failed: {e}") from e
+
+    async def _spawn_workload_process(
+        self, workload_type: str, params: dict, request_id: Optional[str]
+    ) -> None:
+        """Spawn a detached workload process that survives Cloud Node restarts.
+
+        The process runs independently and is tracked by PID. Output is streamed
+        to log files and will be collected when the process completes.
+        """
+        # Build command
+        command_template = (
+            self.config.inference if workload_type == "inference" else self.config.training
+        )
+        params_json = json.dumps(params)
+        command = command_template.replace("{body}", shlex.quote(params_json))
+
+        # Create output files for this workload
+        timestamp = int(time.time())
+        workload_id = f"{workload_type}_{request_id or timestamp}"
+        stdout_file = self._workload_output_dir / f"{workload_id}.stdout.log"
+        stderr_file = self._workload_output_dir / f"{workload_id}.stderr.log"
+
+        logger.info(f"Spawning {workload_type} process: {command}")
+        logger.info(f"Output: {stdout_file}")
+        logger.info(f"Errors: {stderr_file}")
+
+        try:
+            # Spawn detached process
+            # Use bash -c to ensure proper shell expansion
+            shell_command = f"bash -c {shlex.quote(command)}"
+
+            with stdout_file.open("w") as stdout_f, stderr_file.open("w") as stderr_f:
+                process = subprocess.Popen(
+                    shell_command,
+                    shell=True,
+                    stdout=stdout_f,
+                    stderr=stderr_f,
+                    cwd=self.working_dir,
+                    start_new_session=True,  # Detach from parent process
+                    preexec_fn=os.setsid if os.name != "nt" else None,  # Unix only
+                )
+
+            pid = process.pid
+            logger.info(
+                f"Started {workload_type} workload in background process PID {pid} "
+                f"(request_id: {request_id})"
+            )
+
+            # Track the workload
+            workload = ActiveWorkload(
+                pid=pid,
+                request_id=request_id,
+                workload_type=workload_type,
+                started_at=time.time(),
+                command=command,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                params=params,
+            )
+
+            async with self._workload_lock:
+                self._active_workloads[pid] = workload
+
+            # Publish initial acknowledgment
+            self._publish_response(
+                request_id,
+                success=True,
+                output=json.dumps(
+                    {
+                        "message": f"{workload_type} started in background",
+                        "pid": pid,
+                        "status": "running",
+                    }
+                ),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to spawn {workload_type} process: {e}", exc_info=True)
+            raise
+
+    async def _workload_monitor_loop(self) -> None:
+        """Monitor active workload processes and collect results when they complete.
+
+        This loop runs in the background and:
+        1. Checks if workload processes are still alive
+        2. Collects results when processes complete
+        3. Publishes results back via MQTT
+        4. Cleans up completed workloads
+        """
+        logger.info("Starting workload monitor loop")
+        check_interval = 5  # Check every 5 seconds
+
+        while self._running:
+            await asyncio.sleep(check_interval)
+
+            async with self._workload_lock:
+                pids_to_check = list(self._active_workloads.keys())
+
+            for pid in pids_to_check:
+                try:
+                    # Check if process is still alive
+                    if self._is_process_alive(pid):
+                        continue
+
+                    # Process completed - collect results
+                    async with self._workload_lock:
+                        workload = self._active_workloads.get(pid)
+
+                    if not workload:
+                        continue
+
+                    logger.info(
+                        f"Workload process PID {pid} ({workload.workload_type}) completed. "
+                        f"Collecting results..."
+                    )
+
+                    await self._handle_workload_completion(workload)
+
+                    # Remove from active workloads
+                    async with self._workload_lock:
+                        self._active_workloads.pop(pid, None)
+
+                except Exception as e:
+                    logger.error(f"Error monitoring workload PID {pid}: {e}", exc_info=True)
+
+    def _is_process_alive(self, pid: int) -> bool:
+        """Check if a process is still running."""
+        try:
+            process = psutil.Process(pid)
+            return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+
+    async def _handle_workload_completion(self, workload: ActiveWorkload) -> None:
+        """Handle completion of a workload process.
+
+        Collects output, determines exit code, and publishes results.
+        """
+        try:
+            # Get process exit code
+            try:
+                process = psutil.Process(workload.pid)
+                exit_code = process.wait(timeout=1)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                # Process already gone, read from status if available
+                exit_code = None
+
+            # Read output files
+            stdout_content = ""
+            stderr_content = ""
+
+            try:
+                if workload.stdout_file.exists():
+                    stdout_content = workload.stdout_file.read_text()
+            except Exception as e:
+                logger.error(f"Failed to read stdout file: {e}")
+
+            try:
+                if workload.stderr_file.exists():
+                    stderr_content = workload.stderr_file.read_text()
+            except Exception as e:
+                logger.error(f"Failed to read stderr file: {e}")
+
+            # Determine success
+            success = exit_code == 0 if exit_code is not None else False
+
+            # Calculate duration
+            duration = time.time() - workload.started_at
+
+            logger.info(
+                f"Workload {workload.workload_type} (PID {workload.pid}) completed: "
+                f"exit_code={exit_code}, duration={duration:.1f}s, success={success}"
+            )
+
+            # Publish results
+            result_data = {
+                "message": f"{workload.workload_type} completed",
+                "pid": workload.pid,
+                "status": "completed",
+                "success": success,
+                "exit_code": exit_code,
+                "duration_seconds": duration,
+            }
+
+            if stdout_content:
+                # Send stdout via log streaming
+                await self._buffer_log(stdout_content, "stdout")
+
+            if stderr_content:
+                # Send stderr via log streaming
+                await self._buffer_log(stderr_content, "stderr")
+
+            self._publish_response(
+                workload.request_id,
+                success=success,
+                output=json.dumps(result_data),
+                error=stderr_content if not success else None,
+            )
+
+            # Optional: Clean up log files after sending (or keep for debugging)
+            # workload.stdout_file.unlink(missing_ok=True)
+            # workload.stderr_file.unlink(missing_ok=True)
+
+        except Exception as e:
+            logger.error(f"Error handling workload completion: {e}", exc_info=True)
 
     async def _register(self) -> None:
         """Register this node with the Cyberwave backend.
@@ -707,39 +1089,6 @@ class CloudNode:
                 self._stdout_buffer.extend(lines)
                 self._truncate_buffer(self._stdout_buffer)
 
-    async def execute_workload(
-        self,
-        workload_type: str,
-        params: dict,
-        request_id: Optional[str] = None,
-    ) -> WorkloadResult:
-        """Execute an inference or training workload.
-
-        Args:
-            workload_type: Either "inference" or "training"
-            params: Parameters to pass to the command
-            request_id: Optional request ID for logging
-
-        Returns:
-            WorkloadResult with output or error
-        """
-        command_template = (
-            self.config.inference if workload_type == "inference" else self.config.training
-        )
-
-        if not command_template:
-            return WorkloadResult(
-                success=False,
-                error=f"{workload_type} command not configured",
-            )
-
-        # Replace {body} placeholder with JSON-encoded params
-        params_json = json.dumps(params)
-        command = command_template.replace("{body}", shlex.quote(params_json))
-
-        logger.info(f"Executing {workload_type} workload: {command}")
-        return await self._run_command(command, workload_type=workload_type, request_id=request_id)
-
     async def _run_command(
         self,
         command: str,
@@ -756,7 +1105,9 @@ class CloudNode:
         Returns:
             WorkloadResult with output and status
         """
-        logger.info(f"Starting command execution (workload_type: {workload_type}, request_id: {request_id})")
+        logger.info(
+            f"Starting command execution (workload_type: {workload_type}, request_id: {request_id})"
+        )
         logger.info(f"Command: {command}")
 
         try:
@@ -875,56 +1226,79 @@ class CloudNode:
             logger.error(f"Failed to notify backend of failure: {e}")
 
     async def _shutdown(self) -> None:
-        """Perform graceful shutdown."""
+        """Perform graceful shutdown.
+
+        Workloads run as independent OS processes that survive Cloud Node shutdown.
+        This method:
+        1. Stops accepting new commands
+        2. Cancels background monitoring tasks
+        3. Logs any running workloads (they continue independently)
+        4. Flushes logs and notifies backend
+        """
         logger.info("Shutting down Cloud Node...")
         self._running = False
 
-        # Cancel background tasks
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
+        # Step 1: Cancel background tasks (heartbeat, log flush, mqtt monitor, workload monitor)
+        background_tasks = [
+            ("heartbeat", self._heartbeat_task),
+            ("log_flush", self._log_flush_task),
+            ("mqtt_reconnect", self._mqtt_reconnect_task),
+            ("workload_monitor", self._workload_monitor_task),
+        ]
 
-        if self._log_flush_task:
-            self._log_flush_task.cancel()
-            try:
-                await self._log_flush_task
-            except asyncio.CancelledError:
-                pass
+        for task_name, task in background_tasks:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    logger.debug(f"{task_name} task cancelled successfully")
 
-        if self._mqtt_reconnect_task:
-            self._mqtt_reconnect_task.cancel()
-            try:
-                await self._mqtt_reconnect_task
-            except asyncio.CancelledError:
-                pass
+        # Step 2: Check for running workloads (they will continue in background)
+        async with self._workload_lock:
+            active_workloads = list(self._active_workloads.values())
 
-        # Flush any remaining logs before shutdown
+        if active_workloads:
+            logger.info(
+                f"{len(active_workloads)} workload(s) still running in background processes:"
+            )
+            for workload in active_workloads:
+                logger.info(
+                    f"  - PID {workload.pid}: {workload.workload_type} "
+                    f"(running for {int(time.time() - workload.started_at)}s)"
+                )
+            logger.info(
+                "These workloads will continue running independently. "
+                "Output will be available in log files:"
+            )
+            for workload in active_workloads:
+                logger.info(f"  - {workload.stdout_file}")
+
+        # Step 3: Flush any remaining logs before shutdown
         try:
             await self._flush_logs()
             logger.info("Final log flush completed")
         except Exception as e:
             logger.error(f"Failed to flush logs during shutdown: {e}")
 
-        # Notify backend of termination via REST API
+        # Step 4: Notify backend of termination via REST API
         try:
             self.client.terminated(slug=self.slug)
             logger.info("Backend notified of termination")
         except CloudNodeClientError as e:
             logger.error(f"Failed to notify backend of termination: {e}")
 
-        # Disconnect MQTT
+        # Step 5: Disconnect MQTT
         if self._cyberwave:
             try:
                 if self._cyberwave.mqtt:
                     self._cyberwave.mqtt.disconnect()
                 self._cyberwave.disconnect()
+                logger.info("MQTT disconnected")
             except Exception as e:
                 logger.error(f"Error disconnecting from MQTT: {e}")
 
-        # Close REST client
+        # Step 6: Close REST client
         self.client.close()
 
         logger.info("Cloud Node shutdown complete")

@@ -46,8 +46,12 @@ Behind the scenes, Cyberwave Cloud Node will take care of:
 - Storing identity locally for re-registration support
 - Connecting to MQTT to receive commands
 - Sending periodic heartbeats
-- Processing inference and training requests, publishing results back via MQTT
-- Graceful shutdown with termination notification
+- Processing inference and training requests as independent OS processes
+- Monitoring workload processes and collecting results when they complete
+- Graceful shutdown without interrupting running workloads:
+  - Rejects new commands during shutdown
+  - Workloads continue running as independent processes
+  - Flushes logs and notifies backend before terminating
 
 ## Authentication
 
@@ -92,6 +96,7 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 - `CYBERWAVE_TRAINING_CMD`: Training command template
 - `CYBERWAVE_PROFILE_SLUG`: Node profile slug (default: "default")
 - `CYBERWAVE_HEARTBEAT_INTERVAL`: Heartbeat interval in seconds (default: 30)
+
 
 ## CLI Usage
 
@@ -186,7 +191,8 @@ Supported commands:
 
 - `inference` - Run the inference command
 - `training` - Run the training command
-- `status` - Get node status
+- `status` - Get node status (includes active workloads)
+- `cancel` - Cancel a running workload by PID or request_id
 
 ### Response Message Format
 
@@ -211,6 +217,135 @@ On error:
   "error": "Error message here"
 }
 ```
+
+### Cancelling Workloads
+
+To cancel a running workload, send a `cancel` command:
+
+**Cancel by PID:**
+```json
+{
+  "command": "cancel",
+  "request_id": "unique-request-id",
+  "params": {
+    "pid": 12345
+  }
+}
+```
+
+**Cancel by workload request_id:**
+```json
+{
+  "command": "cancel",
+  "request_id": "unique-request-id",
+  "params": {
+    "workload_request_id": "original-training-request-id"
+  }
+}
+```
+
+**Cancel with specific signal:**
+```json
+{
+  "command": "cancel",
+  "request_id": "unique-request-id",
+  "params": {
+    "pid": 12345,
+    "signal": "SIGKILL"
+  }
+}
+```
+
+Supported signals:
+- `SIGTERM` (default) - Graceful termination, allows cleanup
+- `SIGINT` - Interrupt signal (like Ctrl+C)
+- `SIGKILL` - Force kill, immediate termination
+
+**Cancel Response:**
+```json
+{
+  "status": "ok",
+  "request_id": "unique-request-id",
+  "slug": "my-gpu-node",
+  "instance_uuid": "abc-123",
+  "output": {
+    "message": "Workload cancelled with SIGTERM",
+    "pid": 12345,
+    "workload_type": "training",
+    "workload_request_id": "original-training-request-id",
+    "signal": "SIGTERM"
+  }
+}
+```
+
+## Process-Based Workload Management
+
+Training and inference jobs run as **independent OS processes** that survive Cloud Node restarts. This design ensures:
+
+### How It Works
+
+1. **Command Received**: When a training/inference command arrives via MQTT
+   - Cloud Node spawns a detached subprocess (using `start_new_session=True`)
+   - Process runs independently with its own PID
+   - Output streams to log files in `~/.cyberwave/workload_logs/`
+
+2. **Background Monitoring**: The workload monitor loop:
+   - Checks every 5 seconds if workload processes are still alive
+   - Collects results when processes complete
+   - Publishes completion status and output back via MQTT
+
+3. **Node Capacity & Status**: 
+   - Cloud Node tracks active workloads by PID
+   - Rejects new workloads when busy (configurable for concurrent workloads)
+   - Status command returns:
+     ```json
+     {
+       "slug": "my-gpu-node",
+       "instance_uuid": "abc-123",
+       "is_busy": true,
+       "active_workloads": [
+         {
+           "pid": 12345,
+           "type": "training",
+           "request_id": "abc-123",
+           "running_for_seconds": 3600
+         }
+       ]
+     }
+     ```
+
+4. **Workload Cancellation**:
+   - Backend can cancel workloads by PID or request_id
+   - Supports graceful (SIGTERM) or force (SIGKILL) termination
+   - Sends cancellation notification to original workload request
+
+5. **Graceful Shutdown**: When Cloud Node shuts down (Ctrl+C, SIGTERM, SIGINT):
+   - ✅ Stops accepting new commands
+   - ✅ Cancels background monitoring tasks
+   - ✅ Logs running workload PIDs and output file locations
+   - ✅ Workloads **continue running** in background
+   - ✅ Results will be available in log files
+
+### Benefits
+
+- **Resilience**: Cloud Node can restart/upgrade without killing training jobs
+- **Fast Shutdown**: No waiting - shutdown completes immediately
+- **Process Independence**: Training jobs aren't tied to Cloud Node lifecycle
+- **Crash Recovery**: Workloads survive Cloud Node crashes
+- **Simple Monitoring**: Just check PID to see if workload is alive
+
+### Output Files
+
+Workload output is streamed to:
+```
+~/.cyberwave/workload_logs/
+├── training_<request_id>.stdout.log
+├── training_<request_id>.stderr.log
+├── inference_<request_id>.stdout.log
+└── inference_<request_id>.stderr.log
+```
+
+These files are also streamed to the backend in real-time for live monitoring.
 
 ## TODO
 
