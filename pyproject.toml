@@ -1,6 +1,6 @@
 [project]
 name = "cyberwave-cloud-node"
-version = "0.2.10"
+version = "0.2.11"
 description = "Turn any computer into a Cyberwave Cloud Node for inference and training via MQTT"
 readme = "README.md"
 requires-python = ">=3.10"
