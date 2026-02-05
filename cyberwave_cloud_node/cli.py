@@ -63,8 +63,6 @@ def setup_logging(verbose: bool = False) -> None:
 
 def main() -> int:
     """Main entry point for the CLI."""
-    # Initialize Sentry early, before any other operations
-    init_sentry()
 
     parser = argparse.ArgumentParser(
         prog="cyberwave-cloud-node",
@@ -124,6 +122,9 @@ def main() -> int:
     args = parser.parse_args()
 
     setup_logging(args.verbose)
+    
+    # Initialize Sentry early, before any other operations
+    init_sentry()
 
     if args.command is None:
         parser.print_help()
