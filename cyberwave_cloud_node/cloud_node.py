@@ -775,8 +775,7 @@ class CloudNode:
                     stdout=stdout_f,
                     stderr=stderr_f,
                     cwd=self.working_dir,
-                    start_new_session=True,  # Detach from parent process
-                    preexec_fn=os.setsid if os.name != "nt" else None,  # Unix only
+                    start_new_session=True,  # Detach from parent process (cross-platform)
                 )
 
             pid = process.pid
