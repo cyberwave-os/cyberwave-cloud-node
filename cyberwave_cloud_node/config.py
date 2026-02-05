@@ -155,6 +155,8 @@ class CloudNodeConfig:
     mqtt_port: int = DEFAULT_MQTT_PORT
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
+    upload_results: bool = True  # Whether to upload result files after workload completion
+    results_folder: str = "/results"  # Path to folder containing result files
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -174,6 +176,8 @@ class CloudNodeConfig:
             mqtt_port=cloud_node_data.get("mqtt_port", get_mqtt_port()),
             mqtt_username=cloud_node_data.get("mqtt_username", get_mqtt_username()),
             mqtt_password=cloud_node_data.get("mqtt_password", get_mqtt_password()),
+            upload_results=cloud_node_data.get("upload_results", True),
+            results_folder=cloud_node_data.get("results_folder", "/results"),
             extra={
                 k: v
                 for k, v in cloud_node_data.items()
@@ -188,6 +192,8 @@ class CloudNodeConfig:
                     "mqtt_port",
                     "mqtt_username",
                     "mqtt_password",
+                    "upload_results",
+                    "results_folder",
                 }
             },
         )
@@ -235,4 +241,6 @@ class CloudNodeConfig:
             mqtt_port=get_mqtt_port(),
             mqtt_username=get_mqtt_username(),
             mqtt_password=get_mqtt_password(),
+            upload_results=os.getenv("CYBERWAVE_UPLOAD_RESULTS", "true").lower() == "true",
+            results_folder=os.getenv("CYBERWAVE_RESULTS_FOLDER", "/results"),
         )

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import httpx
 from cyberwave import Cyberwave  # type: ignore[import-untyped]
 
 from .client import CloudNodeClient, CloudNodeClientError
@@ -62,6 +63,7 @@ class ActiveWorkload:
     stdout_file: Path
     stderr_file: Path
     params: Dict[str, Any] = field(default_factory=dict)
+    workload_uuid: Optional[str] = None  # UUID of the workload from backend
 
 
 class CloudNode:
@@ -543,6 +545,10 @@ class CloudNode:
         )
 
         # If there's a command_type, execute it
+        # Pass workload_uuid through to command_params so it's available when spawning the process
+        if workload_uuid:
+            command_params["workload_uuid"] = workload_uuid
+
         match command_type:
             case "inference":
                 await self._handle_inference(command_params, request_id)
@@ -785,6 +791,9 @@ class CloudNode:
                 f"(request_id: {request_id})"
             )
 
+            # Extract workload_uuid from params if present (passed from backend)
+            workload_uuid = params.get("workload_uuid")
+
             # Track the workload
             workload = ActiveWorkload(
                 pid=pid,
@@ -795,6 +804,7 @@ class CloudNode:
                 stdout_file=stdout_file,
                 stderr_file=stderr_file,
                 params=params,
+                workload_uuid=workload_uuid,
             )
 
             async with self._workload_lock:
@@ -936,12 +946,108 @@ class CloudNode:
                 error=stderr_content if not success else None,
             )
 
+            # Upload result files if configured and workload_uuid is available
+            if (
+                self.config.upload_results
+                and workload.workload_uuid
+                and success
+            ):
+                await self._upload_result_files(workload)
+
             # Optional: Clean up log files after sending (or keep for debugging)
             # workload.stdout_file.unlink(missing_ok=True)
             # workload.stderr_file.unlink(missing_ok=True)
 
         except Exception as e:
             logger.error(f"Error handling workload completion: {e}", exc_info=True)
+
+    async def _upload_result_files(self, workload: ActiveWorkload) -> None:
+        """Upload result files from the results folder to the backend.
+
+        Checks the configured results folder for files and uploads each one
+        to a signed URL provided by the backend.
+
+        Args:
+            workload: The completed workload with workload_uuid
+        """
+        if not workload.workload_uuid:
+            logger.warning("Cannot upload results: workload_uuid not available")
+            return
+
+        results_path = Path(self.config.results_folder)
+        if not results_path.exists():
+            logger.debug(f"Results folder does not exist: {results_path}")
+            return
+
+        if not results_path.is_dir():
+            logger.warning(f"Results folder is not a directory: {results_path}")
+            return
+
+        # Find all files in the results folder
+        result_files = [f for f in results_path.iterdir() if f.is_file()]
+        if not result_files:
+            logger.debug(f"No result files found in {results_path}")
+            return
+
+        logger.info(
+            f"Found {len(result_files)} result file(s) to upload for workload {workload.workload_uuid}"
+        )
+
+        uploaded_count = 0
+        failed_count = 0
+
+        for file_path in result_files:
+            try:
+                # Get signed URL from backend
+                logger.info(f"Getting signed URL for file: {file_path.name}")
+                signed_url_response = self.client.get_signed_url_for_attachment(
+                    workload_uuid=workload.workload_uuid,
+                    filename=file_path.name,
+                )
+
+                signed_url = signed_url_response.get("signed_url")
+                if not signed_url:
+                    logger.error(f"No signed URL returned for {file_path.name}")
+                    failed_count += 1
+                    continue
+
+                # Upload file to signed URL
+                logger.info(f"Uploading {file_path.name} to signed URL...")
+
+                # Timeout depends on network speed and file size
+                file_size = file_path.stat().st_size
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    with open(file_path, "rb") as f:
+                        upload_response = await client.put(
+                            signed_url,
+                            content=f.read(),
+                            headers={"Content-Type": "application/octet-stream"},
+                        )
+
+                    if upload_response.status_code in (200, 204):
+                        logger.info(f"Successfully uploaded {file_path.name}")
+                        uploaded_count += 1
+                    else:
+                        logger.error(
+                            f"Failed to upload {file_path.name}: "
+                            f"status {upload_response.status_code}, "
+                            f"response: {upload_response.text[:200]}"
+                        )
+                        failed_count += 1
+
+            except CloudNodeClientError as e:
+                logger.error(f"Failed to get signed URL for {file_path.name}: {e}")
+                failed_count += 1
+            except Exception as e:
+                logger.error(
+                    f"Error uploading {file_path.name}: {e}", exc_info=True
+                )
+                failed_count += 1
+
+        logger.info(
+            f"Upload complete: {uploaded_count} succeeded, {failed_count} failed "
+            f"for workload {workload.workload_uuid}"
+        )
 
     async def _register(self) -> None:
         """Register this node with the Cyberwave backend.

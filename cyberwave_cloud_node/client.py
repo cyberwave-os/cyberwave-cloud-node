@@ -643,6 +643,45 @@ class CloudNodeClient:
 
         raise CloudNodeClientError("Log send failed")
 
+    def get_signed_url_for_attachment(
+        self, workload_uuid: str, filename: str, workspace_slug: Optional[str] = None
+    ) -> dict:
+        """Get a signed URL for uploading an attachment to a workload.
+
+        Args:
+            workload_uuid: UUID of the workload
+            filename: Name of the file to upload
+            workspace_slug: Optional workspace slug override
+
+        Returns:
+            Dictionary with signed_url, filename, and expiration_hours
+
+        Raises:
+            CloudNodeClientError: If the request fails
+        """
+        endpoint = f"/api/v1/cloud-node-workloads/{workload_uuid}/attachments"
+        payload = {"filename": filename}
+
+        ws_slug = workspace_slug or self.workspace_slug
+        params = {}
+        if ws_slug:
+            params["workspace_slug"] = ws_slug
+
+        try:
+            response = self._client.post(endpoint, json=payload, params=params)
+
+            if response.status_code == 200:
+                return response.json()
+
+            self._handle_error_response(response, "get_signed_url_for_attachment")
+
+        except httpx.RequestError as e:
+            raise CloudNodeClientError(
+                f"Connection error during signed URL request: {e}"
+            ) from e
+
+        raise CloudNodeClientError("Failed to get signed URL")
+
     def _handle_error_response(self, response: httpx.Response, operation: str) -> None:
         """Handle error responses from the API."""
         try:

@@ -4,8 +4,15 @@ cyberwave-cloud-node:
   provider: self-hosted
   server_port: 9000
   heartbeat_interval: 30
-  
+  upload_results: true
+  results_folder: /results
+
   # Example commands (uncomment and modify as needed)
   # install_script: ./install.sh
   # inference: python inference.py --params {body}
   # training: python train.py --params {body}
+
+  # Upload result files after workload completion
+  # When enabled, files in the results_folder will be uploaded to the backend
+  # upload_results: false
+  # results_folder: /results
