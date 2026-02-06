@@ -964,8 +964,7 @@ class CloudNode:
     async def _upload_result_files(self, workload: ActiveWorkload) -> None:
         """Upload result files from the results folder to the backend.
 
-        Checks the configured results folder for files and uploads each one
-        to a signed URL provided by the backend.
+        Recursively scans the results folder and uploads all files to signed URLs.
 
         Args:
             workload: The completed workload with workload_uuid
@@ -974,80 +973,70 @@ class CloudNode:
             logger.warning("Cannot upload results: workload_uuid not available")
             return
 
-        results_path = Path(self.config.results_folder)
-        if not results_path.exists():
-            logger.debug(f"Results folder does not exist: {results_path}")
-            return
-
+        # Resolve results_folder relative to working_dir (handles both relative and absolute paths)
+        results_path = (self.working_dir / self.config.results_folder).resolve()
+        
         if not results_path.is_dir():
-            logger.warning(f"Results folder is not a directory: {results_path}")
+            logger.debug(f"Results folder not found or not a directory: {results_path}")
             return
 
-        # Find all files in the results folder
-        result_files = [f for f in results_path.iterdir() if f.is_file()]
+        # Recursively find all files (checkpoints are in subdirectories like ./runs/{run_id}/)
+        try:
+            result_files = [f for f in results_path.rglob("*") if f.is_file()]
+        except Exception as e:
+            logger.error(f"Error scanning results folder {results_path}: {e}")
+            return
+
         if not result_files:
             logger.debug(f"No result files found in {results_path}")
             return
 
-        logger.info(
-            f"Found {len(result_files)} result file(s) to upload for workload {workload.workload_uuid}"
-        )
+        logger.info(f"Found {len(result_files)} file(s) to upload from {results_path}")
 
         uploaded_count = 0
         failed_count = 0
 
         for file_path in result_files:
+            # Preserve directory structure by using relative path as filename
+            filename = str(file_path.relative_to(results_path)).replace("\\", "/")
+            
             try:
                 # Get signed URL from backend
-                logger.info(f"Getting signed URL for file: {file_path.name}")
                 signed_url_response = self.client.get_signed_url_for_attachment(
                     workload_uuid=workload.workload_uuid,
-                    filename=file_path.name,
+                    filename=filename,
                 )
-
                 signed_url = signed_url_response.get("signed_url")
+                
                 if not signed_url:
-                    logger.error(f"No signed URL returned for {file_path.name}")
+                    logger.error(f"No signed URL returned for {filename}")
                     failed_count += 1
                     continue
 
-                # Upload file to signed URL
-                logger.info(f"Uploading {file_path.name} to signed URL...")
-
-                # Timeout depends on network speed and file size
-                file_size = file_path.stat().st_size
+                # Upload file
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     with open(file_path, "rb") as f:
-                        upload_response = await client.put(
+                        response = await client.put(
                             signed_url,
                             content=f.read(),
                             headers={"Content-Type": "application/octet-stream"},
                         )
 
-                    if upload_response.status_code in (200, 204):
-                        logger.info(f"Successfully uploaded {file_path.name}")
-                        uploaded_count += 1
-                    else:
-                        logger.error(
-                            f"Failed to upload {file_path.name}: "
-                            f"status {upload_response.status_code}, "
-                            f"response: {upload_response.text[:200]}"
-                        )
-                        failed_count += 1
+                if response.status_code in (200, 204):
+                    logger.info(f"Uploaded: {filename}")
+                    uploaded_count += 1
+                else:
+                    logger.error(f"Upload failed ({response.status_code}): {filename}")
+                    failed_count += 1
 
             except CloudNodeClientError as e:
-                logger.error(f"Failed to get signed URL for {file_path.name}: {e}")
+                logger.error(f"Failed to get signed URL for {filename}: {e}")
                 failed_count += 1
             except Exception as e:
-                logger.error(
-                    f"Error uploading {file_path.name}: {e}", exc_info=True
-                )
+                logger.error(f"Error uploading {filename}: {e}", exc_info=True)
                 failed_count += 1
 
-        logger.info(
-            f"Upload complete: {uploaded_count} succeeded, {failed_count} failed "
-            f"for workload {workload.workload_uuid}"
-        )
+        logger.info(f"Upload complete: {uploaded_count} succeeded, {failed_count} failed")
 
     async def _register(self) -> None:
         """Register this node with the Cyberwave backend.
