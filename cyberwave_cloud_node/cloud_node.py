@@ -213,8 +213,8 @@ class CloudNode:
             if self.config.install_script:
                 await self._run_install_script()
 
-            # Step 2: Connect to MQTT (with retries)
-            await self._connect_mqtt_with_retry()
+            # Step 2: Connect to MQTT
+            await self._connect_mqtt()
 
             # Step 3: Register with backend (REST API)
             await self._register()
@@ -260,62 +260,8 @@ class CloudNode:
             except Exception as shutdown_error:
                 logger.error(f"Error during shutdown: {shutdown_error}", exc_info=True)
 
-    async def _connect_mqtt_with_retry(self, max_retries: int = 10, initial_delay: float = 2.0) -> None:
-        """Connect to the MQTT broker with exponential backoff retries.
-        
-        Args:
-            max_retries: Maximum number of retry attempts
-            initial_delay: Initial delay between retries in seconds (doubles each retry)
-        """
-        token = get_api_token()
-        if not token:
-            raise CloudNodeError(
-                "API token is required. Set CYBERWAVE_API_TOKEN environment variable."
-            )
-
-        self._cyberwave = Cyberwave(
-            token=token,
-            base_url=get_api_url(),
-            mqtt_host=self.config.mqtt_host,
-            mqtt_port=self.config.mqtt_port,
-            mqtt_username=self.config.mqtt_username,
-            mqtt_password=self.config.mqtt_password,
-        )
-
-        delay = initial_delay
-        for attempt in range(max_retries):
-            try:
-                logger.info(
-                    f"Connecting to MQTT broker at {self.config.mqtt_host}:{self.config.mqtt_port} "
-                    f"(attempt {attempt + 1}/{max_retries})"
-                )
-                if not self._cyberwave.mqtt.connected:
-                    self._cyberwave.mqtt.connect()
-                logger.info("Connected to MQTT broker")
-                return
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"Failed to connect to MQTT broker (attempt {attempt + 1}/{max_retries}): {e}. "
-                        f"Retrying in {delay:.1f}s..."
-                    )
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 60.0)  # Exponential backoff, max 60s
-                else:
-                    logger.error(
-                        f"Failed to connect to MQTT broker after {max_retries} attempts: {e}",
-                        exc_info=True
-                    )
-                    raise CloudNodeError(
-                        f"MQTT connection failed after {max_retries} attempts: {e}"
-                    ) from e
-
     async def _connect_mqtt(self) -> None:
-        """Connect to the MQTT broker using the Cyberwave SDK (single attempt).
-        
-        This is kept for backward compatibility and internal use.
-        For retry logic, use _connect_mqtt_with_retry() instead.
-        """
+        """Connect to the MQTT broker using the Cyberwave SDK."""
         logger.info(f"Connecting to MQTT broker at {self.config.mqtt_host}:{self.config.mqtt_port}")
 
         token = get_api_token()
@@ -339,6 +285,7 @@ class CloudNode:
             logger.info("Connected to MQTT broker")
         except Exception as e:
             logger.error(f"Failed to connect to MQTT broker: {e}", exc_info=True)
+            # Raise to allow retry in registration loop
             raise CloudNodeError(f"MQTT connection failed: {e}") from e
 
     async def _subscribe_to_commands(self) -> None:
