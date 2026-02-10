@@ -919,7 +919,6 @@ class CloudNode:
                 f"Workload {workload.workload_type} (PID {workload.pid}) completed: "
                 f"exit_code={exit_code}, duration={duration:.1f}s, success={success}"
             )
-
             # Publish results
             result_data = {
                 "message": f"{workload.workload_type} completed",
@@ -938,24 +937,19 @@ class CloudNode:
                 # Send stderr via log streaming
                 await self._buffer_log(stderr_content, "stderr")
 
-            self._publish_response(
-                workload.request_id,
-                success=success,
-                output=json.dumps(result_data),
-                error=stderr_content if not success else None,
-            )
-
-            # Upload result files if configured and workload_uuid is available
-            if (
-                self.config.upload_results
-                and workload.workload_uuid
-                and success
-            ):
+            if self.config.upload_results and workload.workload_uuid and success:
                 await self._upload_result_files(workload)
 
+            # Notify the backend that the workload has completed
+            self.client.update_workload_status(
+                workload_uuid=str(workload.workload_uuid),
+                instance_uuid=self.instance_uuid,
+                status="completed",
+                payload=result_data,
+            )
             # Optional: Clean up log files after sending (or keep for debugging)
-            # workload.stdout_file.unlink(missing_ok=True)
-            # workload.stderr_file.unlink(missing_ok=True)
+            workload.stdout_file.unlink(missing_ok=True)
+            workload.stderr_file.unlink(missing_ok=True)
 
         except Exception as e:
             logger.error(f"Error handling workload completion: {e}", exc_info=True)
@@ -974,7 +968,7 @@ class CloudNode:
 
         # Resolve results_folder relative to working_dir (handles both relative and absolute paths)
         results_path = (self.working_dir / self.config.results_folder).resolve()
-        
+
         if not results_path.is_dir():
             logger.debug(f"Results folder not found or not a directory: {results_path}")
             return
@@ -995,10 +989,16 @@ class CloudNode:
         uploaded_count = 0
         failed_count = 0
 
+        # Notify the backend of finalizing the results
+        self.client.update_workload_status(
+            workload_uuid=str(workload.workload_uuid),
+            instance_uuid=self.instance_uuid,
+            status="finalizing",
+        )
         for file_path in result_files:
             # Preserve directory structure by using relative path as filename
             filename = str(file_path.relative_to(results_path)).replace("\\", "/")
-            
+
             try:
                 # Get signed URL from backend
                 signed_url_response = self.client.get_signed_url_for_attachment(
@@ -1006,7 +1006,7 @@ class CloudNode:
                     filename=filename,
                 )
                 signed_url = signed_url_response.get("signed_url")
-                
+
                 if not signed_url:
                     logger.error(f"No signed URL returned for {filename}")
                     failed_count += 1

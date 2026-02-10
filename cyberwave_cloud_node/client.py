@@ -9,7 +9,7 @@ This module handles communication with the Cyberwave backend API for:
 import logging
 import uuid as uuid_lib
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -20,6 +20,9 @@ from .config import (
     CLOUD_NODE_LOG_ENDPOINT,
     CLOUD_NODE_REGISTER_ENDPOINT,
     CLOUD_NODE_TERMINATED_ENDPOINT,
+    CLOUD_NODE_WORKLOAD_COMPLETE_ENDPOINT,
+    CLOUD_NODE_WORKLOAD_FAIL_ENDPOINT,
+    CLOUD_NODE_WORKLOAD_UPDATE_ENDPOINT,
     get_api_token,
     get_api_url,
     get_instance_uuid,
@@ -720,3 +723,36 @@ class CloudNodeClient:
             status_code=response.status_code,
             details=data,
         )
+
+    # TODO: Add a response class for this
+    def update_workload_status(
+        self,
+        workload_uuid: str,
+        instance_uuid: str,
+        status: str,
+        payload: dict[str, Any] = {},
+    ) -> dict[str, str]:
+        """Update the status of a workload.
+
+        Args:
+            workload_uuid: UUID of the workload
+            status: Status of the workload
+        """
+
+        match status:
+            case "completed":
+                endpoint = CLOUD_NODE_WORKLOAD_COMPLETE_ENDPOINT.format(uuid=workload_uuid)
+                payload_to_send = payload
+            case "failed":
+                endpoint = CLOUD_NODE_WORKLOAD_FAIL_ENDPOINT.format(uuid=workload_uuid)
+                payload_to_send = payload
+            case "finalizing":
+                endpoint = CLOUD_NODE_WORKLOAD_UPDATE_ENDPOINT.format(uuid=workload_uuid)
+                payload_to_send = {"status": "finalizing", "instance_uuid": instance_uuid}
+            case _:
+                raise CloudNodeClientError(f"Invalid status: {status}")
+        try:
+            response = self._client.post(endpoint, json=payload_to_send)
+            return response.json()
+        except httpx.RequestError as e:
+            raise CloudNodeClientError(f"Connection error during workload update: {e}") from e
