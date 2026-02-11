@@ -29,7 +29,7 @@ import httpx
 import psutil
 
 from .client import CloudNodeClient, CloudNodeClientError
-from .config import CloudNodeConfig, get_api_token
+from .config import CloudNodeConfig, get_api_token, get_instance_uuid, get_instance_slug
 from .mqtt import CloudNodeMQTTClient, MQTTError
 
 logger = logging.getLogger(__name__)
@@ -107,15 +107,15 @@ class CloudNode:
             client: Optional pre-configured CloudNodeClient (for REST API calls)
             working_dir: Working directory for running commands. Defaults to current directory.
         """
-        # Slug is optional - will be assigned by backend during registration
-        self.slug: str = slug or ""
+        # Slug can come from environment, parameter, or will be assigned by backend during registration
+        self.slug: str = slug or get_instance_slug() or ""
         self.config = config
         self.client = client or CloudNodeClient()
         self.working_dir = working_dir or Path.cwd()
 
-        # Instance UUID will be assigned by the backend during registration.
-        # Initialize as empty - will be populated after successful registration.
-        self.instance_uuid: str = ""
+        # Instance UUID can come from environment (e.g., set by Terraform) or will be
+        # assigned by the backend during registration. Check environment first.
+        self.instance_uuid: str = get_instance_uuid() or ""
 
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -215,6 +215,8 @@ class CloudNode:
 
             # Step 2: Connect to MQTT
             await self._connect_mqtt()
+
+            await self._recover_local_workloads()
 
             # Step 3: Register with backend via MQTT
             await self._register_via_mqtt()
@@ -809,6 +811,8 @@ class CloudNode:
             async with self._workload_lock:
                 self._active_workloads[pid] = workload
 
+            await self._save_workload_state()
+
             # Publish initial acknowledgment
             self._publish_response(
                 request_id,
@@ -824,6 +828,79 @@ class CloudNode:
 
         except Exception as e:
             logger.error(f"Failed to spawn {workload_type} process: {e}", exc_info=True)
+            raise
+
+    async def _save_workload_state(self):
+        """Persist active workloads to local file."""
+        state_file = Path.home() / ".cyberwave" / "active_workloads.json"
+
+        async with self._workload_lock:
+            state = {
+                str(pid): {
+                    "pid": pid,
+                    "request_id": w.request_id,
+                    "workload_type": w.workload_type,
+                    "started_at": w.started_at,
+                    "command": w.command,
+                    "stdout_file": str(w.stdout_file),
+                    "stderr_file": str(w.stderr_file),
+                    "params": w.params,
+                    "workload_uuid": w.workload_uuid,
+                }
+                for pid, w in self._active_workloads.items()
+            }
+
+        try:
+            state_file.write_text(json.dumps(state, indent=2))
+            logger.debug(f"Saved workload state ({len(state)} workload(s))")
+        except Exception as e:
+            logger.error(f"Failed to save workload state: {e}")
+            raise
+
+    async def _recover_local_workloads(self):
+        """Load workload state from local file and reattach to running processes."""
+        state_file = Path.home() / ".cyberwave" / "active_workloads.json"
+
+        if not state_file.exists():
+            logger.info("No workload state file found")
+            return
+
+        try:
+            state = json.loads(state_file.read_text())
+            logger.info(f"Found {len(state)} tracked workload(s) from previous session")
+
+            for pid_str, data in state.items():
+                pid = int(pid_str)
+
+                # Check if process still exists
+                if self._is_process_alive(pid):
+                    # Reattach tracking
+                    workload = ActiveWorkload(
+                        pid=pid,
+                        request_id=data["request_id"],
+                        workload_type=data["workload_type"],
+                        started_at=data["started_at"],
+                        command=data["command"],
+                        stdout_file=Path(data["stdout_file"]),
+                        stderr_file=Path(data["stderr_file"]),
+                        params=data.get("params", {}),
+                        workload_uuid=data.get("workload_uuid"),
+                    )
+
+                    self._active_workloads[pid] = workload
+                    logger.info(
+                        f"Recovered workload PID {pid} ({workload.workload_type}, "
+                        f"running for {int(time.time() - workload.started_at)}s)"
+                    )
+                else:
+                    # Process completed while we were down - handle orphaned results
+                    logger.info(f"Workload PID {pid} completed while service was down")
+                    await self._handle_orphaned_completion(data)
+
+            logger.info(f"Recovered {len(self._active_workloads)} active workload(s)")
+
+        except Exception as e:
+            logger.error(f"Failed to recover workload state: {e}", exc_info=True)
             raise
 
     async def _workload_monitor_loop(self) -> None:
@@ -1040,7 +1117,13 @@ class CloudNode:
     async def _register_via_mqtt(self) -> None:
         """Register this node with the Cyberwave backend via MQTT.
 
-        Uses MQTT v5 request/response pattern to create a cloud node instance.
+        Uses MQTT v5 request/response pattern with a conditional two-step flow:
+        1. Request instance creation (only if instance_uuid not set from environment)
+        2. Register the instance with profile (handles restart scenarios)
+        
+        If CYBERWAVE_CLOUD_NODE_INSTANCE_UUID is set in environment (e.g., by Terraform),
+        skips step 1 and goes directly to registration.
+        
         Retries registration every 10 seconds if it fails.
 
         The backend owns the UUID and slug - after successful registration,
@@ -1057,17 +1140,49 @@ class CloudNode:
 
         while self._running:
             try:
-                response = await self._mqtt_client.request_instance(
+                instance_uuid = self.instance_uuid
+                instance_slug = self.slug
+
+                # Step 1: Request instance creation (only if UUID not already set)
+                if not instance_uuid:
+                    logger.info("Step 1: Requesting instance creation (no UUID in environment)...")
+                    create_response = await self._mqtt_client.request_instance(
+                        profile_slug=self.config.profile_slug,
+                        slug=self.slug or None,  # Optional hint, backend assigns actual slug
+                        provider="self-hosted",
+                        visibility="private",
+                        timeout=30.0,
+                    )
+
+                    # Extract instance details from response
+                    instance_uuid = create_response.payload.get("uuid", "")
+                    instance_slug = create_response.payload.get("slug", "")
+
+                    if not instance_uuid or not instance_slug:
+                        raise CloudNodeError(
+                            f"Invalid instance creation response: uuid={instance_uuid}, slug={instance_slug}"
+                        )
+
+                    logger.info(
+                        f"Instance created: UUID={instance_uuid}, Slug={instance_slug}, "
+                        f"Status={create_response.payload.get('status')}"
+                    )
+                else:
+                    logger.info(
+                        f"Step 1: Skipping instance creation (UUID already set from environment: {instance_uuid})"
+                    )
+
+                # Step 2: Register the instance (updates status to READY, handles restart scenarios)
+                logger.info(f"Step 2: Registering instance {instance_uuid}...")
+                register_response = await self._mqtt_client.register_instance(
+                    instance_uuid=instance_uuid,
                     profile_slug=self.config.profile_slug,
-                    slug=self.slug or None,  # Optional hint, backend assigns actual slug
-                    provider="self-hosted",
-                    visibility="private",
                     timeout=30.0,
                 )
 
-                # Extract instance details from response
-                self.instance_uuid = response.payload.get("uuid", "")
-                self.slug = response.payload.get("slug", "")
+                # Update instance details
+                self.instance_uuid = register_response.payload.get("uuid", instance_uuid)
+                self.slug = register_response.payload.get("slug", instance_slug)
 
                 if not self.instance_uuid or not self.slug:
                     raise CloudNodeError(

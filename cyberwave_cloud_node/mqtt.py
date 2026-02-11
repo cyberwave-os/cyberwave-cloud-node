@@ -426,6 +426,53 @@ class CloudNodeMQTTClient:
 
         return response
 
+    async def register_instance(
+        self,
+        instance_uuid: str,
+        profile_slug: str,
+        timeout: float = 30.0,
+    ) -> MQTTResponse:
+        """Register a cloud node instance after creation via MQTT.
+
+        This uses the MQTT v5 request/response pattern to register an instance.
+        It checks the instance state and only registers if needed (PROVISIONING, FAILED, TERMINATED).
+        If the instance is already registered (READY, BUSY), it returns success with existing info.
+
+        Args:
+            instance_uuid: UUID of the instance to register (from request_instance)
+            profile_slug: Profile slug for the instance
+            timeout: Timeout in seconds
+
+        Returns:
+            MQTTResponse with instance details (uuid, slug, status)
+
+        Raises:
+            MQTTError: If request fails
+            asyncio.TimeoutError: If no response within timeout
+        """
+        # Build request payload
+        payload = {
+            "profile_slug": profile_slug,
+        }
+
+        # Publish request to cloud-node register topic
+        topic = f"{self.topic_prefix}cyberwave/cloud-node/{instance_uuid}/register"
+
+        logger.info(f"Registering instance {instance_uuid} via MQTT (profile: {profile_slug})")
+
+        response = await self.publish_request(topic, payload, timeout=timeout)
+
+        if not response.success:
+            error_msg = response.payload.get("message", "Unknown error")
+            raise MQTTError(f"Instance registration failed: {error_msg}")
+
+        logger.info(
+            f"Instance registered successfully: "
+            f"uuid={response.payload.get('uuid')}, slug={response.payload.get('slug')}"
+        )
+
+        return response
+
     async def send_heartbeat(
         self,
         instance_uuid: str,
