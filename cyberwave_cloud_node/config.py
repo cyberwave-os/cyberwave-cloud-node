@@ -216,6 +216,15 @@ class CloudNodeConfig:
             path = Path.cwd() / CONFIG_FILE_NAME
 
         if not path.exists():
+            # fallback: Look for YAML front matter in the README.md file
+            readme_path = path.parent / "README.md"
+            if readme_path.exists():
+                text = readme_path.read_text()
+                parts = text.split("---", 2)
+                if len(parts) >= 3:
+                    data = yaml.safe_load(parts[1]) or {}
+                    return cls.from_dict(data)
+
             raise FileNotFoundError(f"Config file not found: {path}")
 
         with open(path, "r") as f:
