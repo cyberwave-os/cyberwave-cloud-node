@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import os
-import psutil
 import shlex
 import signal
 import subprocess
@@ -27,10 +26,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
-from cyberwave import Cyberwave  # type: ignore[import-untyped]
+import psutil
 
 from .client import CloudNodeClient, CloudNodeClientError
-from .config import CloudNodeConfig, get_api_token, get_api_url
+from .config import CloudNodeConfig, get_api_token
+from .mqtt import CloudNodeMQTTClient, MQTTError
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +138,8 @@ class CloudNode:
         self._log_buffer_lock = asyncio.Lock()
         self._log_flush_interval = 30  # seconds
 
-        # Cyberwave SDK client for MQTT
-        self._cyberwave: Optional[Cyberwave] = None
+        # MQTT v5 client
+        self._mqtt_client: Optional[CloudNodeMQTTClient] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Determine topic prefix from CYBERWAVE_ENVIRONMENT variable
@@ -216,8 +216,8 @@ class CloudNode:
             # Step 2: Connect to MQTT
             await self._connect_mqtt()
 
-            # Step 3: Register with backend (REST API)
-            await self._register()
+            # Step 3: Register with backend via MQTT
+            await self._register_via_mqtt()
 
             # Ensure instance_uuid is set after registration
             if not self.instance_uuid:
@@ -261,7 +261,7 @@ class CloudNode:
                 logger.error(f"Error during shutdown: {shutdown_error}", exc_info=True)
 
     async def _connect_mqtt(self) -> None:
-        """Connect to the MQTT broker using the Cyberwave SDK."""
+        """Connect to the MQTT broker using MQTT v5."""
         logger.info(f"Connecting to MQTT broker at {self.config.mqtt_host}:{self.config.mqtt_port}")
 
         token = get_api_token()
@@ -270,34 +270,30 @@ class CloudNode:
                 "API token is required. Set CYBERWAVE_API_TOKEN environment variable."
             )
 
-        self._cyberwave = Cyberwave(
-            token=token,
-            base_url=get_api_url(),
-            mqtt_host=self.config.mqtt_host,
-            mqtt_port=self.config.mqtt_port,
-            mqtt_username=self.config.mqtt_username,
-            mqtt_password=self.config.mqtt_password,
+        self._mqtt_client = CloudNodeMQTTClient(
+            host=self.config.mqtt_host,
+            port=self.config.mqtt_port,
+            username=self.config.mqtt_username,
+            password=self.config.mqtt_password,
+            keepalive=60,
+            topic_prefix=self._topic_prefix,
         )
 
         try:
-            if not self._cyberwave.mqtt.connected:
-                self._cyberwave.mqtt.connect()
+            await self._mqtt_client.connect()
             logger.info("Connected to MQTT broker")
-        except Exception as e:
+        except MQTTError as e:
             logger.error(f"Failed to connect to MQTT broker: {e}", exc_info=True)
-            # Raise to allow retry in registration loop
             raise CloudNodeError(f"MQTT connection failed: {e}") from e
 
     async def _subscribe_to_commands(self) -> None:
         """Subscribe to MQTT topics for receiving workload commands."""
-        if not self._cyberwave:
+        if not self._mqtt_client:
             raise CloudNodeError("MQTT client not connected")
 
-        def on_command(data: Any) -> None:
+        def on_command(payload: dict[str, Any], properties) -> None:
             """Handle incoming command messages."""
             try:
-                payload = data if isinstance(data, dict) else {}
-
                 # Ignore status messages (responses)
                 if "status" in payload:
                     return
@@ -376,19 +372,23 @@ class CloudNode:
         # Topic pattern: cyberwave/cloud-node/{instance_uuid}/command
         topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/command"
         try:
-            self._cyberwave.mqtt.subscribe(topic, on_command)
+            self._mqtt_client.subscribe_command(topic, on_command)
             logger.info(f"Subscribed to command topic: {topic}")
-        except Exception as e:
+        except MQTTError as e:
             logger.error(f"Failed to subscribe to MQTT topic {topic}: {e}", exc_info=True)
             raise CloudNodeError(f"Failed to subscribe to command topic: {e}") from e
 
     def _publish_message(self, topic_type: str, message: dict) -> None:
         """Publish a message to an MQTT topic."""
-        if not self._cyberwave:
+        if not self._mqtt_client:
             return
         topic = f"{self._topic_prefix}cyberwave/cloud-node/{self.instance_uuid}/{topic_type}"
         try:
-            self._cyberwave.mqtt._client.publish(topic, message)
+            # Use asyncio to run the async publish in a non-blocking way
+            if self._event_loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._mqtt_client.publish_message(topic, message), self._event_loop
+                )
             logger.debug(f"Published message to topic: {topic}")
         except Exception as e:
             logger.error(f"Failed to publish message to {topic}: {e}")
@@ -1037,38 +1037,48 @@ class CloudNode:
 
         logger.info(f"Upload complete: {uploaded_count} succeeded, {failed_count} failed")
 
-    async def _register(self) -> None:
-        """Register this node with the Cyberwave backend.
+    async def _register_via_mqtt(self) -> None:
+        """Register this node with the Cyberwave backend via MQTT.
 
-        Retries registration every 10 seconds if it fails (e.g., if the instance
-        is in a transient state like 'terminating').
+        Uses MQTT v5 request/response pattern to create a cloud node instance.
+        Retries registration every 10 seconds if it fails.
 
         The backend owns the UUID and slug - after successful registration,
         this method updates self.instance_uuid and self.slug with the values
         returned by the backend.
         """
         if self.slug:
-            logger.info(f"Registering Cloud Node with slug hint '{self.slug}'")
+            logger.info(f"Registering Cloud Node via MQTT with slug hint '{self.slug}'")
         else:
-            logger.info("Registering Cloud Node (backend will assign slug)")
+            logger.info("Registering Cloud Node via MQTT (backend will assign slug)")
+
+        if not self._mqtt_client:
+            raise CloudNodeError("MQTT client not connected")
 
         while self._running:
             try:
-                response = self.client.register(
+                response = await self._mqtt_client.request_instance(
                     profile_slug=self.config.profile_slug,
                     slug=self.slug or None,  # Optional hint, backend assigns actual slug
+                    provider="self-hosted",
+                    visibility="private",
+                    timeout=30.0,
                 )
 
-                # Update instance identity with values from backend
-                # The backend is the owner of UUID and slug
-                self.instance_uuid = response.uuid
-                self.slug = response.slug
+                # Extract instance details from response
+                self.instance_uuid = response.payload.get("uuid", "")
+                self.slug = response.payload.get("slug", "")
 
-                logger.info(f"Registration successful: {response.message}")
+                if not self.instance_uuid or not self.slug:
+                    raise CloudNodeError(
+                        f"Invalid registration response: uuid={self.instance_uuid}, slug={self.slug}"
+                    )
+
+                logger.info("Registration successful via MQTT")
                 logger.info(f"Instance UUID: {self.instance_uuid}, Slug: {self.slug}")
                 return
 
-            except CloudNodeClientError as e:
+            except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(f"Registration failed: {e}. Retrying in 10 seconds...")
                 await asyncio.sleep(10)
 
@@ -1076,15 +1086,21 @@ class CloudNode:
         raise CloudNodeError("Registration aborted due to shutdown")
 
     async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to the backend."""
+        """Send periodic heartbeats to the backend via MQTT."""
         logger.info(f"Starting heartbeat loop (interval: {self.config.heartbeat_interval}s)")
 
         while self._running:
             try:
-                response = self.client.heartbeat(slug=self.slug, instance_uuid=self.instance_uuid)
-                logger.debug(f"Heartbeat sent: {response.message}")
+                if self._mqtt_client:
+                    response = await self._mqtt_client.send_heartbeat(
+                        instance_uuid=self.instance_uuid,
+                        timeout=10.0,
+                    )
+                    logger.debug(f"Heartbeat sent via MQTT: {response.payload.get('message')}")
+                else:
+                    logger.warning("MQTT client not available for heartbeat")
 
-            except CloudNodeClientError as e:
+            except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(f"Heartbeat failed: {e}")
                 # Continue trying - the backend might be temporarily unavailable
 
@@ -1108,39 +1124,45 @@ class CloudNode:
 
             try:
                 # Check if MQTT is connected
-                if self._cyberwave and self._cyberwave.mqtt:
-                    if not self._cyberwave.mqtt.connected:
-                        logger.warning("MQTT connection lost, attempting to reconnect...")
-                        try:
-                            self._cyberwave.mqtt.connect()
-                            logger.info("MQTT reconnected successfully")
-                            # Re-subscribe to command topics after reconnection
-                            if self.instance_uuid:
-                                await self._subscribe_to_commands()
-                        except Exception as reconnect_error:
-                            logger.error(
-                                f"Failed to reconnect to MQTT: {reconnect_error}", exc_info=True
-                            )
-                            # Continue monitoring - will retry on next check
+                if self._mqtt_client and not self._mqtt_client.connected:
+                    logger.warning("MQTT connection lost, attempting to reconnect...")
+                    try:
+                        await self._mqtt_client.connect()
+                        logger.info("MQTT reconnected successfully")
+                        # Re-subscribe to command topics after reconnection
+                        if self.instance_uuid:
+                            await self._subscribe_to_commands()
+                    except MQTTError as reconnect_error:
+                        logger.error(
+                            f"Failed to reconnect to MQTT: {reconnect_error}", exc_info=True
+                        )
+                        # Continue monitoring - will retry on next check
             except Exception as e:
                 logger.error(f"Error checking MQTT connection status: {e}", exc_info=True)
                 # Don't crash - continue monitoring
 
     async def _flush_logs(self) -> None:
-        """Flush buffered logs to the backend."""
+        """Flush buffered logs to the backend via MQTT."""
         async with self._log_buffer_lock:
             # Flush stdout buffer
             if self._stdout_buffer:
                 stdout_content = "\n".join(self._stdout_buffer)
                 self._stdout_buffer.clear()
                 try:
-                    self.client.send_log(
-                        log_content=stdout_content,
-                        log_type="stdout",
-                        instance_uuid=self.instance_uuid,
-                    )
-                    logger.debug(f"Flushed {len(stdout_content)} bytes of stdout logs")
-                except CloudNodeClientError as e:
+                    if self._mqtt_client:
+                        await self._mqtt_client.send_log(
+                            instance_uuid=self.instance_uuid,
+                            log_content=stdout_content,
+                            log_type="stdout",
+                            timeout=10.0,
+                        )
+                        logger.debug(f"Flushed {len(stdout_content)} bytes of stdout logs via MQTT")
+                    else:
+                        logger.warning("MQTT client not available for log flush")
+                        # Re-add to buffer
+                        self._stdout_buffer.insert(0, stdout_content)
+                        self._truncate_buffer(self._stdout_buffer)
+                except (MQTTError, asyncio.TimeoutError) as e:
                     logger.warning(f"Failed to flush stdout logs: {e}")
                     # Re-add to buffer for next attempt (but limit size)
                     self._stdout_buffer.insert(0, stdout_content)
@@ -1151,13 +1173,20 @@ class CloudNode:
                 stderr_content = "\n".join(self._stderr_buffer)
                 self._stderr_buffer.clear()
                 try:
-                    self.client.send_log(
-                        log_content=stderr_content,
-                        log_type="stderr",
-                        instance_uuid=self.instance_uuid,
-                    )
-                    logger.debug(f"Flushed {len(stderr_content)} bytes of stderr logs")
-                except CloudNodeClientError as e:
+                    if self._mqtt_client:
+                        await self._mqtt_client.send_log(
+                            instance_uuid=self.instance_uuid,
+                            log_content=stderr_content,
+                            log_type="stderr",
+                            timeout=10.0,
+                        )
+                        logger.debug(f"Flushed {len(stderr_content)} bytes of stderr logs via MQTT")
+                    else:
+                        logger.warning("MQTT client not available for log flush")
+                        # Re-add to buffer
+                        self._stderr_buffer.insert(0, stderr_content)
+                        self._truncate_buffer(self._stderr_buffer)
+                except (MQTTError, asyncio.TimeoutError) as e:
                     logger.warning(f"Failed to flush stderr logs: {e}")
                     # Re-add to buffer for next attempt (but limit size)
                     self._stderr_buffer.insert(0, stderr_content)
@@ -1312,12 +1341,27 @@ class CloudNode:
         signal.signal(signal.SIGTERM, signal_handler)
 
     async def _notify_failed(self, error: str) -> None:
-        """Notify the backend that this node has failed."""
+        """Notify the backend that this node has failed via MQTT."""
         try:
-            self.client.failed(error=error, slug=self.slug)
-            logger.info("Backend notified of failure")
-        except CloudNodeClientError as e:
-            logger.error(f"Failed to notify backend of failure: {e}")
+            if self._mqtt_client:
+                await self._mqtt_client.notify_failed(
+                    instance_uuid=self.instance_uuid,
+                    error=error,
+                    timeout=10.0,
+                )
+                logger.info("Backend notified of failure via MQTT")
+            else:
+                # Fallback to REST API if MQTT not available
+                self.client.failed(error=error, slug=self.slug)
+                logger.info("Backend notified of failure via REST")
+        except (MQTTError, asyncio.TimeoutError) as e:
+            logger.error(f"Failed to notify backend of failure via MQTT: {e}")
+            # Try REST API as fallback
+            try:
+                self.client.failed(error=error, slug=self.slug)
+                logger.info("Backend notified of failure via REST (fallback)")
+            except CloudNodeClientError as rest_e:
+                logger.error(f"Failed to notify backend of failure via REST: {rest_e}")
 
     async def _shutdown(self) -> None:
         """Perform graceful shutdown.
@@ -1375,19 +1419,31 @@ class CloudNode:
         except Exception as e:
             logger.error(f"Failed to flush logs during shutdown: {e}")
 
-        # Step 4: Notify backend of termination via REST API
+        # Step 4: Notify backend of termination via MQTT
         try:
-            self.client.terminated(slug=self.slug)
-            logger.info("Backend notified of termination")
-        except CloudNodeClientError as e:
-            logger.error(f"Failed to notify backend of termination: {e}")
+            if self._mqtt_client and self.instance_uuid:
+                await self._mqtt_client.notify_terminated(
+                    instance_uuid=self.instance_uuid,
+                    timeout=10.0,
+                )
+                logger.info("Backend notified of termination via MQTT")
+            else:
+                # Fallback to REST API if MQTT not available
+                self.client.terminated(slug=self.slug)
+                logger.info("Backend notified of termination via REST")
+        except (MQTTError, asyncio.TimeoutError) as e:
+            logger.error(f"Failed to notify backend of termination via MQTT: {e}")
+            # Try REST API as fallback
+            try:
+                self.client.terminated(slug=self.slug)
+                logger.info("Backend notified of termination via REST (fallback)")
+            except CloudNodeClientError as rest_e:
+                logger.error(f"Failed to notify backend of termination via REST: {rest_e}")
 
         # Step 5: Disconnect MQTT
-        if self._cyberwave:
+        if self._mqtt_client:
             try:
-                if self._cyberwave.mqtt:
-                    self._cyberwave.mqtt.disconnect()
-                self._cyberwave.disconnect()
+                await self._mqtt_client.disconnect()
                 logger.info("MQTT disconnected")
             except Exception as e:
                 logger.error(f"Error disconnecting from MQTT: {e}")
