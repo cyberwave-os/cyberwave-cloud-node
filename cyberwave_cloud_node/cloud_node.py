@@ -749,8 +749,6 @@ class CloudNode:
         command_template = (
             self.config.inference if workload_type == "inference" else self.config.training
         )
-        params_json = json.dumps(params)
-        command = command_template.replace("{body}", shlex.quote(params_json))
 
         # Create output files for this workload
         timestamp = int(time.time())
@@ -758,7 +756,18 @@ class CloudNode:
         stdout_file = self._workload_output_dir / f"{workload_id}.stdout.log"
         stderr_file = self._workload_output_dir / f"{workload_id}.stderr.log"
 
-        logger.info(f"Spawning {workload_type} process: {command}")
+        # For large payloads, write params to a temp file and pass the filename
+        # This avoids "Argument list too long" errors
+        params_json = json.dumps(params)
+        params_file = self._workload_output_dir / f"{workload_id}.params.json"
+        params_file.write_text(params_json)
+
+        # Replace {body} with the path to the params file (wrapped in $(cat ...))
+        # This allows the script to read the params from the file
+        command = command_template.replace("{body}", f"$(cat {shlex.quote(str(params_file))})")
+
+        logger.info(f"Spawning {workload_type} process with params file: {params_file}")
+        logger.info(f"Command: {command}")
         logger.info(f"Output: {stdout_file}")
         logger.info(f"Errors: {stderr_file}")
 
@@ -1021,32 +1030,18 @@ class CloudNode:
                     )
                     logger.info(f"Workload {workload.workload_uuid} completion notified via MQTT")
                 except (MQTTError, asyncio.TimeoutError) as e:
-                    logger.warning(f"Failed to notify workload completion via MQTT: {e}")
-                    # Fallback to REST API
-                    try:
-                        self.client.update_workload_status(
-                            workload_uuid=str(workload.workload_uuid),
-                            instance_uuid=self.instance_uuid,
-                            status="completed",
-                            payload=result_data,
-                        )
-                        logger.info("Workload completion notified via REST (fallback)")
-                    except Exception as rest_error:
-                        logger.error(f"Failed to notify workload completion via REST: {rest_error}")
-            elif workload.workload_uuid:
-                # Fallback to REST API if MQTT not available
-                try:
-                    self.client.update_workload_status(
-                        workload_uuid=str(workload.workload_uuid),
-                        instance_uuid=self.instance_uuid,
-                        status="completed",
-                        payload=result_data,
-                    )
-                except Exception as rest_error:
-                    logger.error(f"Failed to notify workload completion via REST: {rest_error}")
-            # Optional: Clean up log files after sending (or keep for debugging)
+                    logger.error(f"Failed to notify workload completion via MQTT: {e}")
+
+            # Clean up workload files (log files and params file)
             workload.stdout_file.unlink(missing_ok=True)
             workload.stderr_file.unlink(missing_ok=True)
+
+            # Clean up params file (has same base name as stdout file but with .params.json)
+            params_file = (
+                workload.stdout_file.parent
+                / f"{workload.stdout_file.stem.replace('.stdout', '')}.params.json"
+            )
+            params_file.unlink(missing_ok=True)
 
         except Exception as e:
             logger.error(f"Error handling workload completion: {e}", exc_info=True)
@@ -1096,24 +1091,14 @@ class CloudNode:
                         "message": "Starting result file upload",
                     },
                 )
-                logger.info(f"Notified backend of finalizing status for workload {workload.workload_uuid} via MQTT")
+                logger.info(
+                    f"Notified backend of finalizing status for workload {workload.workload_uuid} via MQTT"
+                )
             except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(
                     f"Failed to notify backend of finalizing status via MQTT: {e}. "
                     "Continuing with file uploads."
                 )
-                # Fallback to REST API if MQTT fails
-                try:
-                    self.client.update_workload_status(
-                        workload_uuid=str(workload.workload_uuid),
-                        instance_uuid=self.instance_uuid,
-                        status="finalizing",
-                    )
-                except CloudNodeClientError as rest_error:
-                    logger.warning(
-                        f"Failed to notify backend of finalizing status via REST (fallback): {rest_error}. "
-                        "Continuing with file uploads."
-                    )
         for file_path in result_files:
             # Preserve directory structure by using relative path as filename
             filename = str(file_path.relative_to(results_path)).replace("\\", "/")
@@ -1513,17 +1498,9 @@ class CloudNode:
                 )
                 logger.info("Backend notified of failure via MQTT")
             else:
-                # Fallback to REST API if MQTT not available
-                self.client.failed(error=error, slug=self.slug)
-                logger.info("Backend notified of failure via REST")
+                logger.error("MQTT client not available to notify backend of failure")
         except (MQTTError, asyncio.TimeoutError) as e:
             logger.error(f"Failed to notify backend of failure via MQTT: {e}")
-            # Try REST API as fallback
-            try:
-                self.client.failed(error=error, slug=self.slug)
-                logger.info("Backend notified of failure via REST (fallback)")
-            except CloudNodeClientError as rest_e:
-                logger.error(f"Failed to notify backend of failure via REST: {rest_e}")
 
     async def _shutdown(self) -> None:
         """Perform graceful shutdown.
@@ -1590,17 +1567,9 @@ class CloudNode:
                 )
                 logger.info("Backend notified of termination via MQTT")
             else:
-                # Fallback to REST API if MQTT not available
-                self.client.terminated(slug=self.slug)
-                logger.info("Backend notified of termination via REST")
+                logger.error("MQTT client not available to notify backend of termination")
         except (MQTTError, asyncio.TimeoutError) as e:
             logger.error(f"Failed to notify backend of termination via MQTT: {e}")
-            # Try REST API as fallback
-            try:
-                self.client.terminated(slug=self.slug)
-                logger.info("Backend notified of termination via REST (fallback)")
-            except CloudNodeClientError as rest_e:
-                logger.error(f"Failed to notify backend of termination via REST: {rest_e}")
 
         # Step 5: Disconnect MQTT
         if self._mqtt_client:

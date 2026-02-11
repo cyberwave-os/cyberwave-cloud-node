@@ -683,6 +683,41 @@ class CloudNodeClient:
 
         raise CloudNodeClientError("Failed to get signed URL")
 
+    def complete_workload(
+        self, workload_uuid: str, workspace_slug: Optional[str] = None
+    ) -> dict:
+        """Mark a workload as completed.
+
+        Args:
+            workload_uuid: UUID of the workload to complete
+            workspace_slug: Optional workspace slug override
+
+        Returns:
+            Dictionary with success status and message
+
+        Raises:
+            CloudNodeClientError: If the request fails
+        """
+        endpoint = f"/api/v1/cloud-node-workloads/{workload_uuid}/complete"
+
+        ws_slug = workspace_slug or self.workspace_slug
+        params = {}
+        if ws_slug:
+            params["workspace_slug"] = ws_slug
+
+        try:
+            response = self._client.post(endpoint, params=params)
+
+            if response.status_code == 200:
+                return response.json()
+
+            self._handle_error_response(response, "complete_workload")
+
+        except httpx.RequestError as e:
+            raise CloudNodeClientError(f"Connection error during workload completion: {e}") from e
+
+        raise CloudNodeClientError("Failed to complete workload")
+
     def _handle_error_response(self, response: httpx.Response, operation: str) -> None:
         """Handle error responses from the API."""
         try:
