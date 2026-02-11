@@ -613,6 +613,80 @@ class CloudNodeMQTTClient:
 
         return response
 
+    async def update_workload_status(
+        self,
+        workload_uuid: str,
+        status: str,
+        additional_data: dict[str, Any] = {},
+        timeout: float = 30.0,
+    ) -> MQTTResponse:
+        """Update workload status via MQTT.
+
+        Args:
+            workload_uuid: UUID of the workload
+            status: New status for the workload (e.g., "running", "failed", "finalizing")
+            additional_data: Additional data to include in the payload
+            timeout: Timeout in seconds
+
+        Returns:
+            MQTTResponse with update confirmation
+
+        Raises:
+            MQTTError: If request fails
+            asyncio.TimeoutError: If no response within timeout
+        """
+        topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/update-status"
+
+        payload = {
+            "status": status,
+            **additional_data,
+        }
+
+        logger.info(f"Updating workload {workload_uuid} status to {status} via MQTT")
+
+        response = await self.publish_request(topic, payload, timeout=timeout)
+
+        if not response.success:
+            error_msg = response.payload.get("message", "Unknown error")
+            raise MQTTError(f"Workload status update failed: {error_msg}")
+
+        logger.info(f"Workload {workload_uuid} status updated successfully")
+        return response
+
+    async def complete_workload(
+        self,
+        workload_uuid: str,
+        timeout: float = 30.0,
+    ) -> MQTTResponse:
+        """Mark workload as completed via MQTT.
+
+        Args:
+            workload_uuid: UUID of the workload to complete
+            timeout: Timeout in seconds
+
+        Returns:
+            MQTTResponse with completion confirmation
+
+        Raises:
+            MQTTError: If request fails
+            asyncio.TimeoutError: If no response within timeout
+        """
+        topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/update-status"
+
+        # Send status as dict for consistency (backend handles both formats)
+        payload = {"status": "completed"}
+
+        logger.info(f"Completing workload {workload_uuid} via MQTT")
+
+        response = await self.publish_request(topic, payload, timeout=timeout)
+
+        if not response.success:
+            error_msg = response.payload.get("message", "Unknown error")
+            raise MQTTError(f"Workload completion failed: {error_msg}")
+
+        logger.info(f"Workload {workload_uuid} completed successfully")
+        return response
+
     @property
     def connected(self) -> bool:
         """Check if connected to broker."""

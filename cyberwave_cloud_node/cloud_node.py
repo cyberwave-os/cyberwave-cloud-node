@@ -814,17 +814,15 @@ class CloudNode:
             await self._save_workload_state()
 
             # Publish initial acknowledgment
-            self._publish_response(
-                request_id,
-                success=True,
-                output=json.dumps(
-                    {
-                        "message": f"{workload_type} started in background",
-                        "pid": pid,
-                        "status": "running",
-                    }
-                ),
+            await self._mqtt_client.update_workload_status(
+                workload_uuid=workload_uuid,
+                status="running",
+                additional_data={
+                    "message": f"{workload_type} started in background",
+                    "pid": pid,
+                },
             )
+            return
 
         except Exception as e:
             logger.error(f"Failed to spawn {workload_type} process: {e}", exc_info=True)
