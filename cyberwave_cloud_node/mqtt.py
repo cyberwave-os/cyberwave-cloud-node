@@ -623,7 +623,7 @@ class CloudNodeMQTTClient:
         """Update workload status via MQTT.
 
         Args:
-            workload_uuid: UUID of the workload
+            workload_uuid: UUID of the workload (must not be None or empty)
             status: New status for the workload (e.g., "running", "failed", "finalizing")
             additional_data: Additional data to include in the payload
             timeout: Timeout in seconds
@@ -632,9 +632,12 @@ class CloudNodeMQTTClient:
             MQTTResponse with update confirmation
 
         Raises:
-            MQTTError: If request fails
+            MQTTError: If request fails or workload_uuid is invalid
             asyncio.TimeoutError: If no response within timeout
         """
+        if not workload_uuid or workload_uuid == "None":
+            raise MQTTError(f"Invalid workload_uuid: {workload_uuid}. Cannot update workload status.")
+        
         topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/update-status"
 
         payload = {
@@ -661,16 +664,19 @@ class CloudNodeMQTTClient:
         """Mark workload as completed via MQTT.
 
         Args:
-            workload_uuid: UUID of the workload to complete
+            workload_uuid: UUID of the workload to complete (must not be None or empty)
             timeout: Timeout in seconds
 
         Returns:
             MQTTResponse with completion confirmation
 
         Raises:
-            MQTTError: If request fails
+            MQTTError: If request fails or workload_uuid is invalid
             asyncio.TimeoutError: If no response within timeout
         """
+        if not workload_uuid or workload_uuid == "None":
+            raise MQTTError(f"Invalid workload_uuid: {workload_uuid}. Cannot complete workload.")
+        
         topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/update-status"
 
         # Send status as dict for consistency (backend handles both formats)

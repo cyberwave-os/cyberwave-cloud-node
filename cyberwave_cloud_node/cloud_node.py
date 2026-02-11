@@ -358,15 +358,6 @@ class CloudNode:
                         self._publish_response(
                             request_id, success=False, error=f"Unknown command: {command}"
                         )
-
-                self._publish_message(
-                    "telemetry",
-                    {
-                        "command": command,
-                        "request_id": request_id,
-                        "received": "true",
-                    },
-                )
             except Exception as e:
                 logger.error(f"Error processing command: {e}", exc_info=True)
 
@@ -814,6 +805,12 @@ class CloudNode:
             await self._save_workload_state()
 
             # Publish initial acknowledgment
+            if not self._mqtt_client:
+                logger.warning("MQTT client not available, skipping workload status update")
+                return
+            if not workload_uuid:
+                logger.warning("Workload UUID not available, skipping workload status update")
+                return
             await self._mqtt_client.update_workload_status(
                 workload_uuid=workload_uuid,
                 status="running",
@@ -893,7 +890,7 @@ class CloudNode:
                 else:
                     # Process completed while we were down - handle orphaned results
                     logger.info(f"Workload PID {pid} completed while service was down")
-                    await self._handle_orphaned_completion(data)
+                    # await self._handle_orphaned_completion(data)
 
             logger.info(f"Recovered {len(self._active_workloads)} active workload(s)")
 
@@ -1015,13 +1012,38 @@ class CloudNode:
             if self.config.upload_results and workload.workload_uuid and success:
                 await self._upload_result_files(workload)
 
-            # Notify the backend that the workload has completed
-            self.client.update_workload_status(
-                workload_uuid=str(workload.workload_uuid),
-                instance_uuid=self.instance_uuid,
-                status="completed",
-                payload=result_data,
-            )
+            # Notify the backend that the workload has completed via MQTT
+            if workload.workload_uuid and self._mqtt_client:
+                try:
+                    await self._mqtt_client.complete_workload(
+                        workload_uuid=str(workload.workload_uuid),
+                        timeout=30.0,
+                    )
+                    logger.info(f"Workload {workload.workload_uuid} completion notified via MQTT")
+                except (MQTTError, asyncio.TimeoutError) as e:
+                    logger.warning(f"Failed to notify workload completion via MQTT: {e}")
+                    # Fallback to REST API
+                    try:
+                        self.client.update_workload_status(
+                            workload_uuid=str(workload.workload_uuid),
+                            instance_uuid=self.instance_uuid,
+                            status="completed",
+                            payload=result_data,
+                        )
+                        logger.info("Workload completion notified via REST (fallback)")
+                    except Exception as rest_error:
+                        logger.error(f"Failed to notify workload completion via REST: {rest_error}")
+            elif workload.workload_uuid:
+                # Fallback to REST API if MQTT not available
+                try:
+                    self.client.update_workload_status(
+                        workload_uuid=str(workload.workload_uuid),
+                        instance_uuid=self.instance_uuid,
+                        status="completed",
+                        payload=result_data,
+                    )
+                except Exception as rest_error:
+                    logger.error(f"Failed to notify workload completion via REST: {rest_error}")
             # Optional: Clean up log files after sending (or keep for debugging)
             workload.stdout_file.unlink(missing_ok=True)
             workload.stderr_file.unlink(missing_ok=True)
@@ -1064,12 +1086,34 @@ class CloudNode:
         uploaded_count = 0
         failed_count = 0
 
-        # Notify the backend of finalizing the results
-        self.client.update_workload_status(
-            workload_uuid=str(workload.workload_uuid),
-            instance_uuid=self.instance_uuid,
-            status="finalizing",
-        )
+        # Notify the backend of finalizing the results via MQTT
+        if workload.workload_uuid and self._mqtt_client:
+            try:
+                await self._mqtt_client.update_workload_status(
+                    workload_uuid=str(workload.workload_uuid),
+                    status="finalizing",
+                    additional_data={
+                        "message": "Starting result file upload",
+                    },
+                )
+                logger.info(f"Notified backend of finalizing status for workload {workload.workload_uuid} via MQTT")
+            except (MQTTError, asyncio.TimeoutError) as e:
+                logger.warning(
+                    f"Failed to notify backend of finalizing status via MQTT: {e}. "
+                    "Continuing with file uploads."
+                )
+                # Fallback to REST API if MQTT fails
+                try:
+                    self.client.update_workload_status(
+                        workload_uuid=str(workload.workload_uuid),
+                        instance_uuid=self.instance_uuid,
+                        status="finalizing",
+                    )
+                except CloudNodeClientError as rest_error:
+                    logger.warning(
+                        f"Failed to notify backend of finalizing status via REST (fallback): {rest_error}. "
+                        "Continuing with file uploads."
+                    )
         for file_path in result_files:
             # Preserve directory structure by using relative path as filename
             filename = str(file_path.relative_to(results_path)).replace("\\", "/")
@@ -1118,10 +1162,10 @@ class CloudNode:
         Uses MQTT v5 request/response pattern with a conditional two-step flow:
         1. Request instance creation (only if instance_uuid not set from environment)
         2. Register the instance with profile (handles restart scenarios)
-        
+
         If CYBERWAVE_CLOUD_NODE_INSTANCE_UUID is set in environment (e.g., by Terraform),
         skips step 1 and goes directly to registration.
-        
+
         Retries registration every 10 seconds if it fails.
 
         The backend owns the UUID and slug - after successful registration,
@@ -1180,12 +1224,17 @@ class CloudNode:
 
                 # Update instance details
                 self.instance_uuid = register_response.payload.get("uuid", instance_uuid)
-                self.slug = register_response.payload.get("slug", instance_slug)
+                self.slug = register_response.payload.get("slug", instance_slug) or ""
 
-                if not self.instance_uuid or not self.slug:
-                    raise CloudNodeError(
-                        f"Invalid registration response: uuid={self.instance_uuid}, slug={self.slug}"
+                if not self.instance_uuid:
+                    raise CloudNodeError(f"Invalid registration response: missing uuid")
+
+                # If slug is empty, generate a fallback slug from uuid (shouldn't happen with backend fix, but safety measure)
+                if not self.slug:
+                    logger.warning(
+                        f"Registration response missing slug, using uuid-based fallback slug"
                     )
+                    self.slug = f"cn-{self.instance_uuid[:8]}"
 
                 logger.info("Registration successful via MQTT")
                 logger.info(f"Instance UUID: {self.instance_uuid}, Slug: {self.slug}")

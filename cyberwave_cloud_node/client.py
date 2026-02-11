@@ -679,9 +679,7 @@ class CloudNodeClient:
             self._handle_error_response(response, "get_signed_url_for_attachment")
 
         except httpx.RequestError as e:
-            raise CloudNodeClientError(
-                f"Connection error during signed URL request: {e}"
-            ) from e
+            raise CloudNodeClientError(f"Connection error during signed URL request: {e}") from e
 
         raise CloudNodeClientError("Failed to get signed URL")
 
@@ -723,36 +721,3 @@ class CloudNodeClient:
             status_code=response.status_code,
             details=data,
         )
-
-    # TODO: Add a response class for this
-    def update_workload_status(
-        self,
-        workload_uuid: str,
-        instance_uuid: str,
-        status: str,
-        payload: dict[str, Any] = {},
-    ) -> dict[str, str]:
-        """Update the status of a workload.
-
-        Args:
-            workload_uuid: UUID of the workload
-            status: Status of the workload
-        """
-
-        match status:
-            case "completed":
-                endpoint = CLOUD_NODE_WORKLOAD_COMPLETE_ENDPOINT.format(uuid=workload_uuid)
-                payload_to_send = payload
-            case "failed":
-                endpoint = CLOUD_NODE_WORKLOAD_FAIL_ENDPOINT.format(uuid=workload_uuid)
-                payload_to_send = payload
-            case "finalizing":
-                endpoint = CLOUD_NODE_WORKLOAD_UPDATE_ENDPOINT.format(uuid=workload_uuid)
-                payload_to_send = {"status": "finalizing", "instance_uuid": instance_uuid}
-            case _:
-                raise CloudNodeClientError(f"Invalid status: {status}")
-        try:
-            response = self._client.post(endpoint, json=payload_to_send)
-            return response.json()
-        except httpx.RequestError as e:
-            raise CloudNodeClientError(f"Connection error during workload update: {e}") from e
