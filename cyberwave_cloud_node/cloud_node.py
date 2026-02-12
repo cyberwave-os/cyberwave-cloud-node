@@ -14,6 +14,7 @@ and collect results when workloads complete.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -756,15 +757,58 @@ class CloudNode:
         stdout_file = self._workload_output_dir / f"{workload_id}.stdout.log"
         stderr_file = self._workload_output_dir / f"{workload_id}.stderr.log"
 
+        # Process image_bytes_base64 if present: decode and save as file
+        # This avoids "Argument list too long" errors and makes params cleaner
+        if "image_bytes_base64" in params and params["image_bytes_base64"]:
+            try:
+                # Decode base64 image
+                image_base64 = params["image_bytes_base64"]
+                # Remove data URL prefix if present (e.g., "data:image/jpeg;base64,...")
+                if "," in image_base64:
+                    image_base64 = image_base64.split(",", 1)[1]
+                
+                image_bytes = base64.b64decode(image_base64)
+                
+                # Determine image format from bytes (check magic numbers)
+                if image_bytes.startswith(b"\xff\xd8\xff"):
+                    ext = "jpg"
+                elif image_bytes.startswith(b"\x89PNG"):
+                    ext = "png"
+                elif image_bytes.startswith(b"GIF"):
+                    ext = "gif"
+                elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:12]:
+                    ext = "webp"
+                else:
+                    # Default to jpg if format unknown
+                    ext = "jpg"
+                
+                # Save image to inputs directory
+                inputs_dir = Path("/inputs")
+                inputs_dir.mkdir(parents=True, exist_ok=True)
+                image_filename = f"image_{workload_id}.{ext}"
+                image_path = inputs_dir / image_filename
+                
+                image_path.write_bytes(image_bytes)
+                logger.info(f"Decoded and saved image to {image_path} ({len(image_bytes)} bytes)")
+                
+                # Replace image_bytes_base64 with image filename in params
+                params["image"] = image_filename
+                del params["image_bytes_base64"]
+                
+            except Exception as e:
+                logger.error(f"Failed to process image_bytes_base64: {e}", exc_info=True)
+                # Continue without image - let the script handle the error
+
         # For large payloads, write params to a temp file and pass the filename
         # This avoids "Argument list too long" errors
         params_json = json.dumps(params)
         params_file = self._workload_output_dir / f"{workload_id}.params.json"
         params_file.write_text(params_json)
 
-        # Replace {body} with the path to the params file (wrapped in $(cat ...))
-        # This allows the script to read the params from the file
-        command = command_template.replace("{body}", f"$(cat {shlex.quote(str(params_file))})")
+        # Replace {body} with the path to the params file directly
+        # The script should detect it's a file path and read from it
+        # This avoids "Argument list too long" errors by not expanding JSON in command line
+        command = command_template.replace("{body}", shlex.quote(str(params_file)))
 
         logger.info(f"Spawning {workload_type} process with params file: {params_file}")
         logger.info(f"Command: {command}")
@@ -776,12 +820,22 @@ class CloudNode:
             # Use bash -c to ensure proper shell expansion
             shell_command = f"bash -c {shlex.quote(command)}"
 
+            # Prepare environment for subprocess
+            # Inherit parent environment and explicitly pass Sentry config
+            subprocess_env = os.environ.copy()
+            sentry_vars = ["SENTRY_DSN", "SENTRY_TRACES_SAMPLE_RATE", "SENTRY_PROFILES_SAMPLE_RATE", "SENTRY_RELEASE", "CYBERWAVE_ENVIRONMENT"]
+            for var in sentry_vars:
+                if var in os.environ:
+                    subprocess_env[var] = os.environ[var]
+                    logger.debug(f"Passing {var} to subprocess")
+
             with stdout_file.open("w") as stdout_f, stderr_file.open("w") as stderr_f:
                 process = subprocess.Popen(
                     shell_command,
                     shell=True,
                     stdout=stdout_f,
                     stderr=stderr_f,
+                    env=subprocess_env,
                     cwd=self.working_dir,
                     start_new_session=True,  # Detach from parent process (cross-platform)
                 )
