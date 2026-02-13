@@ -974,9 +974,11 @@ class CloudNode:
 
         # Resolve results_folder relative to working_dir (handles both relative and absolute paths)
         results_path = (self.working_dir / self.config.results_folder).resolve()
-        
+
         if not results_path.is_dir():
-            logger.debug(f"Results folder not found or not a directory: {results_path}")
+            logger.warning(
+                f"Results folder not found or not a directory: {results_path}"
+            )
             return
 
         # Recursively find all files (checkpoints are in subdirectories like ./runs/{run_id}/)
@@ -987,55 +989,110 @@ class CloudNode:
             return
 
         if not result_files:
-            logger.debug(f"No result files found in {results_path}")
+            logger.warning(f"No result files found in {results_path}")
             return
 
+        result_files.sort()
         logger.info(f"Found {len(result_files)} file(s) to upload from {results_path}")
 
         uploaded_count = 0
         failed_count = 0
+        max_attempts = 3
+        base_retry_delay_seconds = 2.0
 
-        for file_path in result_files:
-            # Preserve directory structure by using relative path as filename
-            filename = str(file_path.relative_to(results_path)).replace("\\", "/")
-            
-            try:
-                # Get signed URL from backend
-                signed_url_response = self.client.get_signed_url_for_attachment(
-                    workload_uuid=workload.workload_uuid,
-                    filename=filename,
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for file_path in result_files:
+                # Preserve directory structure by using relative path as filename
+                filename = str(file_path.relative_to(results_path)).replace("\\", "/")
+
+                try:
+                    file_size = file_path.stat().st_size
+                except OSError:
+                    file_size = 0
+                upload_timeout_seconds = max(
+                    300.0, min(1800.0, (file_size / (1024 * 1024)) * 8 + 120)
                 )
-                signed_url = signed_url_response.get("signed_url")
-                
-                if not signed_url:
-                    logger.error(f"No signed URL returned for {filename}")
-                    failed_count += 1
-                    continue
 
-                # Upload file
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    with open(file_path, "rb") as f:
-                        response = await client.put(
-                            signed_url,
-                            content=f.read(),
-                            headers={"Content-Type": "application/octet-stream"},
+                file_uploaded = False
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        # Fetch a fresh signed URL for each attempt to avoid stale URLs.
+                        signed_url_response = self.client.get_signed_url_for_attachment(
+                            workload_uuid=workload.workload_uuid,
+                            filename=filename,
                         )
+                        signed_url = signed_url_response.get("signed_url")
 
-                if response.status_code in (200, 204):
-                    logger.info(f"Uploaded: {filename}")
-                    uploaded_count += 1
-                else:
-                    logger.error(f"Upload failed ({response.status_code}): {filename}")
+                        if not signed_url:
+                            raise CloudNodeClientError(
+                                f"No signed URL returned for {filename}"
+                            )
+
+                        with open(file_path, "rb") as file_handle:
+                            response = await client.put(
+                                signed_url,
+                                content=file_handle,
+                                headers={"Content-Type": "application/octet-stream"},
+                                timeout=upload_timeout_seconds,
+                            )
+
+                        if response.status_code in (200, 204):
+                            logger.info(
+                                f"Uploaded: {filename} ({file_size} bytes, attempt {attempt})"
+                            )
+                            uploaded_count += 1
+                            file_uploaded = True
+                            break
+
+                        retriable_status_codes = {408, 409, 425, 429, 500, 502, 503, 504}
+                        is_retriable = response.status_code in retriable_status_codes
+                        if not is_retriable:
+                            logger.error(
+                                f"Upload failed ({response.status_code}) and is not retriable: "
+                                f"{filename}"
+                            )
+                            break
+
+                        if attempt < max_attempts:
+                            retry_delay = base_retry_delay_seconds * (2 ** (attempt - 1))
+                            logger.warning(
+                                f"Upload failed ({response.status_code}) for {filename}; "
+                                f"retrying in {retry_delay:.1f}s (attempt {attempt}/{max_attempts})"
+                            )
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            logger.error(
+                                f"Upload failed after {max_attempts} attempts "
+                                f"({response.status_code}): {filename}"
+                            )
+
+                    except (CloudNodeClientError, httpx.TimeoutException, httpx.RequestError) as e:
+                        if attempt < max_attempts:
+                            retry_delay = base_retry_delay_seconds * (2 ** (attempt - 1))
+                            logger.warning(
+                                f"Upload attempt {attempt}/{max_attempts} failed for {filename}: {e}. "
+                                f"Retrying in {retry_delay:.1f}s"
+                            )
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            logger.error(
+                                f"Failed to upload {filename} after {max_attempts} attempts: {e}"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error uploading {filename}: {e}", exc_info=True)
+                        break
+
+                if not file_uploaded:
                     failed_count += 1
 
-            except CloudNodeClientError as e:
-                logger.error(f"Failed to get signed URL for {filename}: {e}")
-                failed_count += 1
-            except Exception as e:
-                logger.error(f"Error uploading {filename}: {e}", exc_info=True)
-                failed_count += 1
-
-        logger.info(f"Upload complete: {uploaded_count} succeeded, {failed_count} failed")
+        if failed_count:
+            logger.warning(
+                f"Upload complete with failures: {uploaded_count} succeeded, {failed_count} failed"
+            )
+        else:
+            logger.info(
+                f"Upload complete: {uploaded_count} succeeded, {failed_count} failed"
+            )
 
     async def _register(self) -> None:
         """Register this node with the Cyberwave backend.
