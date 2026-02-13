@@ -24,7 +24,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 from cyberwave import Cyberwave  # type: ignore[import-untyped]
@@ -1000,6 +1000,17 @@ class CloudNode:
         max_attempts = 3
         base_retry_delay_seconds = 2.0
 
+        async def _file_chunk_stream(
+            file_path: Path, chunk_size: int = 1024 * 1024
+        ) -> AsyncIterator[bytes]:
+            """Yield file chunks as async stream for AsyncClient uploads."""
+            with open(file_path, "rb") as file_handle:
+                while True:
+                    chunk = await asyncio.to_thread(file_handle.read, chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             for file_path in result_files:
                 # Preserve directory structure by using relative path as filename
@@ -1028,13 +1039,15 @@ class CloudNode:
                                 f"No signed URL returned for {filename}"
                             )
 
-                        with open(file_path, "rb") as file_handle:
-                            response = await client.put(
-                                signed_url,
-                                content=file_handle,
-                                headers={"Content-Type": "application/octet-stream"},
-                                timeout=upload_timeout_seconds,
-                            )
+                        response = await client.put(
+                            signed_url,
+                            content=_file_chunk_stream(file_path),
+                            headers={
+                                "Content-Type": "application/octet-stream",
+                                "Content-Length": str(file_size),
+                            },
+                            timeout=upload_timeout_seconds,
+                        )
 
                         if response.status_code in (200, 204):
                             logger.info(
