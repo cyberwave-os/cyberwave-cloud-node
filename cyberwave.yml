@@ -1,18 +1,27 @@
 # Cyberwave Cloud Node configuration for local testing
+# Uses mock scripts for realistic workload testing without GPU
 cyberwave-cloud-node:
-  profile_slug: gpu-a100
+  profile_slug: openvla-oft
   provider: self-hosted
-  server_port: 9000
+  server_port: 8080
   heartbeat_interval: 30
-  upload_results: true
-  results_folder: /results
+  upload_results: false
+  results_folder: /tmp/cyberwave-test/results
+  
+  # Mock inference command (simulates Hunyuan3D-2 mesh generation)
+  # Uses mock_inference.py which copies a test.glb to results
+  inference: |
+    echo "Starting mock inference..." && \
+    export RESULTS_DIR=/tmp/cyberwave-test/results && \
+    export INPUT_DIR=/tmp/cyberwave-test/inputs && \
+    python3 /Users/cicciodepa/git/cyberwave/cyberwave-cloud-nodes/tests/hunyuan3d/mock_inference.py {body} 2>&1 || \
+    (echo "Mock inference fallback: simple test" && sleep 3 && echo '{"status": "completed"}' > /tmp/cyberwave-test/results/inference_result.json && echo "Inference complete")
 
-  # Example commands (uncomment and modify as needed)
-  # install_script: ./install.sh
-  # inference: python inference.py --params {body}
-  # training: python train.py --params {body}
-
-  # Upload result files after workload completion
-  # When enabled, files in the results_folder will be uploaded to the backend
-  # upload_results: false
-  # results_folder: /results
+  # Mock training command (simulates OpenVLA-OFT fine-tuning)
+  # Uses mock_training.py which creates mock checkpoint files
+  training: |
+    echo "Starting mock training..." && \
+    export RESULTS_DIR=/tmp/cyberwave-test/results && \
+    export RUNS_DIR=/tmp/cyberwave-test/runs && \
+    python3 /Users/cicciodepa/git/cyberwave/cyberwave-cloud-nodes/tests/openvla-oft/mock_training.py {body} 2>&1 || \
+    (echo "Mock training fallback: simple test" && sleep 5 && echo '{"status": "completed", "steps": 5}' > /tmp/cyberwave-test/results/training_result.json && echo "Training complete")
