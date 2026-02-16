@@ -58,6 +58,7 @@ class CloudNodeMQTTClient:
         keepalive: int = 60,
         client_id: Optional[str] = None,
         topic_prefix: str = "",
+        api_token: Optional[str] = None,
     ):
         """Initialize MQTT client.
 
@@ -69,6 +70,7 @@ class CloudNodeMQTTClient:
             keepalive: Keepalive interval in seconds
             client_id: Client ID (auto-generated if not provided)
             topic_prefix: Prefix for all topics (for environment separation)
+            api_token: Cyberwave API token for user authentication (optional)
         """
         self.host = host
         self.port = port
@@ -76,6 +78,7 @@ class CloudNodeMQTTClient:
         self.password = password
         self.keepalive = keepalive
         self.topic_prefix = topic_prefix
+        self.api_token = api_token
 
         # Generate client ID if not provided
         if not client_id:
@@ -249,6 +252,10 @@ class CloudNodeMQTTClient:
         properties = Properties(PacketTypes.PUBLISH)
         properties.ResponseTopic = self._response_topic  # type: ignore[attr-defined]
         properties.CorrelationData = correlation_data  # type: ignore[attr-defined]
+
+        # Add API token for authentication if available
+        if self.api_token:
+            properties.UserProperty = [("X-API-Token", self.api_token)]  # type: ignore[attr-defined]
 
         # Create future for response
         future: asyncio.Future[MQTTResponse] = asyncio.Future()

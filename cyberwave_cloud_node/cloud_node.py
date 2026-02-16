@@ -280,6 +280,7 @@ class CloudNode:
             password=self.config.mqtt_password,
             keepalive=60,
             topic_prefix=self._topic_prefix,
+            api_token=token,
         )
 
         try:
@@ -1244,6 +1245,8 @@ class CloudNode:
 
         # Track successful uploads for result notification
         uploaded_files: list[dict[str, str]] = []
+        # Track successfully uploaded file paths for deletion
+        successfully_uploaded_paths: list[Path] = []
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             for file_path in result_files:
@@ -1319,13 +1322,14 @@ class CloudNode:
                             )
                             uploaded_count += 1
                             file_uploaded = True
-                            # Track successful upload for result notification
+                            # Track successful upload for result notification and deletion
                             if attachment_uuid and signed_url:
                                 uploaded_files.append({
                                     "filename": filename,
                                     "signed_url": signed_url,
                                     "attachment_uuid": attachment_uuid,
                                 })
+                                successfully_uploaded_paths.append(file_path)
                             break
 
                         retriable_status_codes = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -1370,6 +1374,7 @@ class CloudNode:
                     failed_count += 1
 
         # Step 3d: Notify backend about upload results (if any files were uploaded successfully)
+        backend_notified = False
         if uploaded_files and workload.workload_uuid:
             try:
                 filenames = [f["filename"] for f in uploaded_files]
@@ -1389,6 +1394,7 @@ class CloudNode:
                             f"Notified backend via MQTT about {len(uploaded_files)} uploaded file(s) "
                             f"for workload {workload.workload_uuid}"
                         )
+                        backend_notified = True
                     except (MQTTError, asyncio.TimeoutError) as e:
                         logger.warning(
                             f"MQTT upload results notification failed: {e}. "
@@ -1406,10 +1412,11 @@ class CloudNode:
                                 f"Notified backend via HTTP about {len(uploaded_files)} uploaded file(s) "
                                 f"for workload {workload.workload_uuid}"
                             )
+                            backend_notified = True
                         except Exception as http_e:
                             logger.error(
                                 f"HTTP upload results notification also failed: {http_e}. "
-                                "Results uploaded but backend not notified."
+                                "Results uploaded but backend not notified. Files will not be deleted."
                             )
                 else:
                     # Use HTTP client
@@ -1424,16 +1431,33 @@ class CloudNode:
                             f"Notified backend via HTTP about {len(uploaded_files)} uploaded file(s) "
                             f"for workload {workload.workload_uuid}"
                         )
+                        backend_notified = True
                     except Exception as e:
                         logger.error(
                             f"HTTP upload results notification failed: {e}. "
-                            "Results uploaded but backend not notified."
+                            "Results uploaded but backend not notified. Files will not be deleted."
                         )
             except Exception as e:
                 logger.error(
                     f"Failed to notify backend about upload results: {e}. "
-                    "Results uploaded but backend not notified."
+                    "Results uploaded but backend not notified. Files will not be deleted."
                 )
+
+        # Step 3f: Delete successfully uploaded files after backend notification
+        if backend_notified and successfully_uploaded_paths:
+            deleted_count = 0
+            for file_path in successfully_uploaded_paths:
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        deleted_count += 1
+                        logger.debug(f"Deleted uploaded file: {file_path}")
+                    else:
+                        logger.debug(f"File already deleted or not found: {file_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete uploaded file {file_path}: {e}")
+            if deleted_count > 0:
+                logger.info(f"Deleted {deleted_count} successfully uploaded file(s) after backend notification")
 
         # Step 3e: Log upload completion summary
         if failed_count:
