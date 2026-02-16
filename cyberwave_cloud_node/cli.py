@@ -123,9 +123,6 @@ def main() -> int:
 
     setup_logging(args.verbose)
     
-    # Initialize Sentry early, before any other operations
-    init_sentry()
-
     if args.command is None:
         parser.print_help()
         return 1
@@ -149,6 +146,8 @@ def start_node(args: argparse.Namespace) -> int:
 
     # Load .env files (from working dir and ~/.cyberwave/)
     load_dotenv_files(working_dir)
+    # Initialize Sentry after dotenv loading so SENTRY_DSN from .env is honored.
+    init_sentry()
 
     # Check for API token (now checks env vars, .env files, and stored credentials)
     if not get_api_token():
