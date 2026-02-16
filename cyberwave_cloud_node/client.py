@@ -683,6 +683,57 @@ class CloudNodeClient:
 
         raise CloudNodeClientError("Failed to get signed URL")
 
+    def upload_workload_results(
+        self,
+        workload_uuid: str,
+        filenames: list[str],
+        signed_urls: list[str],
+        attachment_uuids: list[str],
+        workspace_slug: Optional[str] = None,
+    ) -> dict:
+        """Notify backend about uploaded workload result files.
+
+        This endpoint is called after files have been uploaded to signed URLs.
+
+        Args:
+            workload_uuid: UUID of the workload
+            filenames: List of filenames that were uploaded
+            signed_urls: List of signed URLs that were used for upload
+            attachment_uuids: List of attachment UUIDs
+            workspace_slug: Optional workspace slug override
+
+        Returns:
+            Dictionary with success status and message
+
+        Raises:
+            CloudNodeClientError: If the request fails
+        """
+        endpoint = f"/api/v1/cloud-node-workloads/{workload_uuid}/upload-results"
+
+        ws_slug = workspace_slug or self.workspace_slug
+        params = {}
+        if ws_slug:
+            params["workspace_slug"] = ws_slug
+
+        payload = {
+            "filenames": filenames,
+            "signed_urls": signed_urls,
+            "attachment_uuids": attachment_uuids,
+        }
+
+        try:
+            response = self._client.post(endpoint, json=payload, params=params)
+
+            if response.status_code == 200:
+                return response.json()
+
+            self._handle_error_response(response, "upload_workload_results")
+
+        except httpx.RequestError as e:
+            raise CloudNodeClientError(f"Connection error during upload results: {e}") from e
+
+        raise CloudNodeClientError("Failed to upload workload results")
+
     def complete_workload(
         self, workload_uuid: str, workspace_slug: Optional[str] = None
     ) -> dict:

@@ -636,8 +636,10 @@ class CloudNodeMQTTClient:
             asyncio.TimeoutError: If no response within timeout
         """
         if not workload_uuid or workload_uuid == "None":
-            raise MQTTError(f"Invalid workload_uuid: {workload_uuid}. Cannot update workload status.")
-        
+            raise MQTTError(
+                f"Invalid workload_uuid: {workload_uuid}. Cannot update workload status."
+            )
+
         topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/update-status"
 
         payload = {
@@ -676,7 +678,7 @@ class CloudNodeMQTTClient:
         """
         if not workload_uuid or workload_uuid == "None":
             raise MQTTError(f"Invalid workload_uuid: {workload_uuid}. Cannot complete workload.")
-        
+
         topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/update-status"
 
         # Send status as dict for consistency (backend handles both formats)
@@ -691,6 +693,105 @@ class CloudNodeMQTTClient:
             raise MQTTError(f"Workload completion failed: {error_msg}")
 
         logger.info(f"Workload {workload_uuid} completed successfully")
+        return response
+
+    async def request_signed_url_for_attachment(
+        self,
+        workload_uuid: str,
+        filename: str,
+        timeout: float = 30.0,
+    ) -> MQTTResponse:
+        """Request a signed URL for uploading an attachment to a workload via MQTT.
+
+        Args:
+            workload_uuid: UUID of the workload
+            filename: Name of the file to upload
+            timeout: Timeout in seconds
+
+        Returns:
+            MQTTResponse with signed_url, filename, and expiration_hours
+
+        Raises:
+            MQTTError: If request fails or workload_uuid is invalid
+            asyncio.TimeoutError: If no response within timeout
+        """
+        if not workload_uuid or workload_uuid == "None":
+            raise MQTTError(f"Invalid workload_uuid: {workload_uuid}. Cannot request signed URL.")
+
+        topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/request-signed-url"
+
+        payload = {
+            "filename": filename,
+        }
+
+        logger.debug(
+            f"Requesting signed URL for workload {workload_uuid}, filename: {filename}"
+        )
+
+        response = await self.publish_request(topic, payload, timeout=timeout)
+
+        # Check for signed_url in payload (backend may not include success field)
+        signed_url = response.payload.get("signed_url")
+        if not signed_url:
+            # If no signed_url, check for error
+            if not response.success:
+                error_msg = response.payload.get("message", "Unknown error")
+                raise MQTTError(f"Signed URL request failed: {error_msg}")
+            else:
+                raise MQTTError("Signed URL request failed: No signed_url in response")
+
+        logger.debug(
+            f"Received signed URL for workload {workload_uuid}, filename: {filename}"
+        )
+        return response
+
+    async def upload_workload_results(
+        self,
+        workload_uuid: str,
+        filenames: list[str],
+        signed_urls: list[str],
+        attachment_uuids: list[str],
+        timeout: float = 30.0,
+    ) -> MQTTResponse:
+        """Upload workload results via MQTT after files have been uploaded to signed URLs.
+
+        Args:
+            workload_uuid: UUID of the workload
+            filenames: List of filenames that were uploaded
+            signed_urls: List of signed URLs that were used for upload
+            attachment_uuids: List of attachment UUIDs
+            timeout: Timeout in seconds
+
+        Returns:
+            MQTTResponse with upload confirmation
+
+        Raises:
+            MQTTError: If request fails or workload_uuid is invalid
+            asyncio.TimeoutError: If no response within timeout
+        """
+        if not workload_uuid or workload_uuid == "None":
+            raise MQTTError(f"Invalid workload_uuid: {workload_uuid}. Cannot upload results.")
+
+        topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/upload-results"
+
+        payload = {
+            "filenames": filenames,
+            "signed_urls": signed_urls,
+            "attachment_uuids": attachment_uuids,
+        }
+
+        logger.info(
+            f"Uploading results for workload {workload_uuid} via MQTT "
+            f"({len(filenames)} file(s))"
+        )
+
+        response = await self.publish_request(topic, payload, timeout=timeout)
+
+        if not response.success:
+            error_msg = response.payload.get("message", "Unknown error")
+            raise MQTTError(f"Upload results failed: {error_msg}")
+
+        logger.info(f"Results uploaded successfully for workload {workload_uuid}")
         return response
 
     @property

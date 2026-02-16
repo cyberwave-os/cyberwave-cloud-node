@@ -766,9 +766,9 @@ class CloudNode:
                 # Remove data URL prefix if present (e.g., "data:image/jpeg;base64,...")
                 if "," in image_base64:
                     image_base64 = image_base64.split(",", 1)[1]
-                
+
                 image_bytes = base64.b64decode(image_base64)
-                
+
                 # Determine image format from bytes (check magic numbers)
                 if image_bytes.startswith(b"\xff\xd8\xff"):
                     ext = "jpg"
@@ -781,20 +781,20 @@ class CloudNode:
                 else:
                     # Default to jpg if format unknown
                     ext = "jpg"
-                
+
                 # Save image to inputs directory
                 inputs_dir = Path("/inputs")
                 inputs_dir.mkdir(parents=True, exist_ok=True)
                 image_filename = f"image_{workload_id}.{ext}"
                 image_path = inputs_dir / image_filename
-                
+
                 image_path.write_bytes(image_bytes)
                 logger.info(f"Decoded and saved image to {image_path} ({len(image_bytes)} bytes)")
-                
+
                 # Replace image_bytes_base64 with image filename in params
                 params["image"] = image_filename
                 del params["image_bytes_base64"]
-                
+
             except Exception as e:
                 logger.error(f"Failed to process image_bytes_base64: {e}", exc_info=True)
                 # Continue without image - let the script handle the error
@@ -823,7 +823,13 @@ class CloudNode:
             # Prepare environment for subprocess
             # Inherit parent environment and explicitly pass Sentry config
             subprocess_env = os.environ.copy()
-            sentry_vars = ["SENTRY_DSN", "SENTRY_TRACES_SAMPLE_RATE", "SENTRY_PROFILES_SAMPLE_RATE", "SENTRY_RELEASE", "CYBERWAVE_ENVIRONMENT"]
+            sentry_vars = [
+                "SENTRY_DSN",
+                "SENTRY_TRACES_SAMPLE_RATE",
+                "SENTRY_PROFILES_SAMPLE_RATE",
+                "SENTRY_RELEASE",
+                "CYBERWAVE_ENVIRONMENT",
+            ]
             for var in sentry_vars:
                 if var in os.environ:
                     subprocess_env[var] = os.environ[var]
@@ -985,7 +991,17 @@ class CloudNode:
                     if self._is_process_alive(pid):
                         continue
 
-                    # Process completed - collect results
+                    # Process completed - try to get exit code immediately before cleanup
+                    exit_code = None
+                    try:
+                        process = psutil.Process(pid)
+                        # Try to get exit code immediately (process might still be a zombie)
+                        exit_code = process.wait(timeout=0.1)
+                    except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                        # Process already cleaned up, will try again in completion handler
+                        pass
+
+                    # Collect results
                     async with self._workload_lock:
                         workload = self._active_workloads.get(pid)
 
@@ -997,7 +1013,7 @@ class CloudNode:
                         f"Collecting results..."
                     )
 
-                    await self._handle_workload_completion(workload)
+                    await self._handle_workload_completion(workload, exit_code=exit_code)
 
                     # Remove from active workloads
                     async with self._workload_lock:
@@ -1015,29 +1031,34 @@ class CloudNode:
             return False
 
     async def _file_chunk_stream(
-            file_path: Path, chunk_size: int = 1024 * 1024
-        ) -> AsyncIterator[bytes]:
-            """Yield file chunks as async stream for AsyncClient uploads."""
-            with open(file_path, "rb") as file_handle:
-                while True:
-                    chunk = await asyncio.to_thread(file_handle.read, chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
+        self, file_path: Path, chunk_size: int = 1024 * 1024
+    ) -> AsyncIterator[bytes]:
+        """Yield file chunks as async stream for AsyncClient uploads."""
+        with open(file_path, "rb") as file_handle:
+            while True:
+                chunk = await asyncio.to_thread(file_handle.read, chunk_size)
+                if not chunk:
+                    break
+                yield chunk
 
-    async def _handle_workload_completion(self, workload: ActiveWorkload) -> None:
+    async def _handle_workload_completion(self, workload: ActiveWorkload, exit_code: int | None = None) -> None:
         """Handle completion of a workload process.
 
         Collects output, determines exit code, and publishes results.
+        
+        Args:
+            workload: The completed workload
+            exit_code: Optional exit code if already captured (to avoid race conditions)
         """
         try:
-            # Get process exit code
-            try:
-                process = psutil.Process(workload.pid)
-                exit_code = process.wait(timeout=1)
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                # Process already gone, read from status if available
-                exit_code = None
+            # Get process exit code if not already provided
+            if exit_code is None:
+                try:
+                    process = psutil.Process(workload.pid)
+                    exit_code = process.wait(timeout=0.5)
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                    # Process already gone, try to infer from output
+                    exit_code = None
 
             # Read output files
             stdout_content = ""
@@ -1056,7 +1077,21 @@ class CloudNode:
                 logger.error(f"Failed to read stderr file: {e}")
 
             # Determine success
-            success = exit_code == 0 if exit_code is not None else False
+            # If exit_code is None, check stdout for success indicators (e.g., "✅ Successfully")
+            if exit_code is None:
+                # Try to infer success from stdout content
+                if stdout_content and ("✅" in stdout_content or "Successfully" in stdout_content):
+                    # If we see success indicators and no error indicators, assume success
+                    if "❌" not in stdout_content and "Error" not in stdout_content:
+                        exit_code = 0
+                        success = True
+                    else:
+                        success = False
+                else:
+                    # No exit code and no clear success indicators - assume failure
+                    success = False
+            else:
+                success = exit_code == 0
 
             # Calculate duration
             duration = time.time() - workload.started_at
@@ -1083,10 +1118,30 @@ class CloudNode:
                 # Send stderr via log streaming
                 await self._buffer_log(stderr_content, "stderr")
 
-            if self.config.upload_results and workload.workload_uuid and success:
-                await self._upload_result_files(workload)
+            # Step 3a: Check for files to upload and handle upload process
+            # Only upload on success, and only if upload_results is enabled
+            should_upload = self.config.upload_results and workload.workload_uuid and success
 
-            # Notify the backend that the workload has completed via MQTT
+            if should_upload:
+                # Check if result files exist before sending "finalizing" status
+                upload_result = await self._upload_result_files(workload)
+                if upload_result["files_found"]:
+                    logger.info(
+                        f"Result file upload completed for workload {workload.workload_uuid}: "
+                        f"{upload_result['uploaded_count']} succeeded, {upload_result['failed_count']} failed"
+                    )
+                else:
+                    logger.info(
+                        f"No result files found for workload {workload.workload_uuid}, skipping upload"
+                    )
+            elif self.config.upload_results and workload.workload_uuid and not success:
+                logger.info(
+                    f"Skipping result file upload for workload {workload.workload_uuid} "
+                    f"(workload failed with exit_code={exit_code})"
+                )
+
+            # Step 3e: Notify the backend that the workload has completed via MQTT
+            # This happens AFTER uploads are complete (or skipped)
             if workload.workload_uuid and self._mqtt_client:
                 try:
                     await self._mqtt_client.complete_workload(
@@ -1111,47 +1166,57 @@ class CloudNode:
         except Exception as e:
             logger.error(f"Error handling workload completion: {e}", exc_info=True)
 
-    async def _upload_result_files(self, workload: ActiveWorkload) -> None:
+    async def _upload_result_files(self, workload: ActiveWorkload) -> dict[str, int | bool]:
         """Upload result files from the results folder to the backend.
 
         Recursively scans the results folder and uploads all files to signed URLs.
+        Follows the sequence:
+        1. Check if files exist
+        2. If files exist, send "finalizing" status
+        3. Upload files
+        4. Return upload results
 
         Args:
             workload: The completed workload with workload_uuid
+
+        Returns:
+            Dictionary with keys: files_found (bool), uploaded_count (int), failed_count (int)
         """
         if not workload.workload_uuid:
             logger.warning("Cannot upload results: workload_uuid not available")
-            return
+            return {"files_found": False, "uploaded_count": 0, "failed_count": 0}
 
         # Resolve results_folder relative to working_dir (handles both relative and absolute paths)
-        results_path = (self.working_dir / self.config.results_folder).resolve()
+        # If results_folder starts with '/', it's absolute; otherwise it's relative to working_dir
+        if self.config.results_folder.startswith("/"):
+            results_path = Path(self.config.results_folder)
+        else:
+            results_path = (self.working_dir / self.config.results_folder).resolve()
+
+        logger.info(
+            f"Scanning results folder: {results_path} "
+            f"(working_dir: {self.working_dir}, config.results_folder: {self.config.results_folder})"
+        )
 
         if not results_path.is_dir():
-            logger.warning(
-                f"Results folder not found or not a directory: {results_path}"
-            )
-            return
+            logger.warning(f"Results folder not found or not a directory: {results_path}")
+            return {"files_found": False, "uploaded_count": 0, "failed_count": 0}
 
         # Recursively find all files (checkpoints are in subdirectories like ./runs/{run_id}/)
         try:
             result_files = [f for f in results_path.rglob("*") if f.is_file()]
         except Exception as e:
             logger.error(f"Error scanning results folder {results_path}: {e}")
-            return
+            return {"files_found": False, "uploaded_count": 0, "failed_count": 0}
 
         if not result_files:
-            logger.warning(f"No result files found in {results_path}")
-            return
+            logger.info(f"No result files found in {results_path}")
+            return {"files_found": False, "uploaded_count": 0, "failed_count": 0}
 
         result_files.sort()
         logger.info(f"Found {len(result_files)} file(s) to upload from {results_path}")
 
-        uploaded_count = 0
-        failed_count = 0
-        max_attempts = 3
-        base_retry_delay_seconds = 2.0
-
-        # Notify the backend of finalizing the results via MQTT
+        # Step 3b: Send "finalizing" status now that we know files exist
         if workload.workload_uuid and self._mqtt_client:
             try:
                 await self._mqtt_client.update_workload_status(
@@ -1159,36 +1224,26 @@ class CloudNode:
                     status="finalizing",
                     additional_data={
                         "message": "Starting result file upload",
+                        "file_count": len(result_files),
                     },
                 )
                 logger.info(
-                    f"Notified backend of finalizing status for workload {workload.workload_uuid} via MQTT"
+                    f"Notified backend of finalizing status for workload {workload.workload_uuid} via MQTT "
+                    f"({len(result_files)} file(s) to upload)"
                 )
             except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(
                     f"Failed to notify backend of finalizing status via MQTT: {e}. "
                     "Continuing with file uploads."
                 )
-        for file_path in result_files:
-            # Preserve directory structure by using relative path as filename
-            filename = str(file_path.relative_to(results_path)).replace("\\", "/")
 
-            try:
-                # Get signed URL from backend
-                signed_url_response = self.client.get_signed_url_for_attachment(
-                    workload_uuid=workload.workload_uuid,
-                    filename=filename,
-                )
-                signed_url = signed_url_response.get("signed_url")
+        uploaded_count = 0
+        failed_count = 0
+        max_attempts = 3
+        base_retry_delay_seconds = 2.0
 
-                if not signed_url:
-                    logger.error(f"No signed URL returned for {filename}")
-                    failed_count += 1
-                    continue
-            except Exception as e:
-                logger.error(f"Error getting signed URL for {filename}: {e}")
-                failed_count += 1
-                continue
+        # Track successful uploads for result notification
+        uploaded_files: list[dict[str, str]] = []
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             for file_path in result_files:
@@ -1204,23 +1259,53 @@ class CloudNode:
                 )
 
                 file_uploaded = False
+                attachment_uuid = None
+                signed_url = None
                 for attempt in range(1, max_attempts + 1):
                     try:
                         # Fetch a fresh signed URL for each attempt to avoid stale URLs.
-                        signed_url_response = self.client.get_signed_url_for_attachment(
-                            workload_uuid=workload.workload_uuid,
-                            filename=filename,
-                        )
-                        signed_url = signed_url_response.get("signed_url")
+                        # Prefer MQTT if available, fall back to HTTP
+                        if self._mqtt_client and self._mqtt_client.connected:
+                            try:
+                                signed_url_response = await self._mqtt_client.request_signed_url_for_attachment(
+                                    workload_uuid=workload.workload_uuid,
+                                    filename=filename,
+                                )
+                                signed_url = signed_url_response.payload.get("signed_url")
+                                # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
+                                response_filename = signed_url_response.payload.get("filename", "")
+                                attachment_uuid = os.path.splitext(response_filename)[0] if response_filename else None
+                            except (MQTTError, asyncio.TimeoutError) as e:
+                                logger.warning(
+                                    f"MQTT signed URL request failed for {filename}: {e}. "
+                                    "Falling back to HTTP."
+                                )
+                                # Fall back to HTTP
+                                signed_url_response = self.client.get_signed_url_for_attachment(
+                                    workload_uuid=workload.workload_uuid,
+                                    filename=filename,
+                                )
+                                signed_url = signed_url_response.get("signed_url")
+                                # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
+                                response_filename = signed_url_response.get("filename", "")
+                                attachment_uuid = os.path.splitext(response_filename)[0] if response_filename else None
+                        else:
+                            # Use HTTP client
+                            signed_url_response = self.client.get_signed_url_for_attachment(
+                                workload_uuid=workload.workload_uuid,
+                                filename=filename,
+                            )
+                            signed_url = signed_url_response.get("signed_url")
+                            # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
+                            response_filename = signed_url_response.get("filename", "")
+                            attachment_uuid = os.path.splitext(response_filename)[0] if response_filename else None
 
                         if not signed_url:
-                            raise CloudNodeClientError(
-                                f"No signed URL returned for {filename}"
-                            )
+                            raise CloudNodeClientError(f"No signed URL returned for {filename}")
 
                         response = await client.put(
                             signed_url,
-                            content=_file_chunk_stream(file_path),
+                            content=self._file_chunk_stream(file_path),
                             headers={
                                 "Content-Type": "application/octet-stream",
                                 "Content-Length": str(file_size),
@@ -1234,6 +1319,13 @@ class CloudNode:
                             )
                             uploaded_count += 1
                             file_uploaded = True
+                            # Track successful upload for result notification
+                            if attachment_uuid and signed_url:
+                                uploaded_files.append({
+                                    "filename": filename,
+                                    "signed_url": signed_url,
+                                    "attachment_uuid": attachment_uuid,
+                                })
                             break
 
                         retriable_status_codes = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -1277,14 +1369,85 @@ class CloudNode:
                 if not file_uploaded:
                     failed_count += 1
 
+        # Step 3d: Notify backend about upload results (if any files were uploaded successfully)
+        if uploaded_files and workload.workload_uuid:
+            try:
+                filenames = [f["filename"] for f in uploaded_files]
+                signed_urls = [f["signed_url"] for f in uploaded_files]
+                attachment_uuids = [f["attachment_uuid"] for f in uploaded_files]
+
+                # Prefer MQTT if available, fall back to HTTP
+                if self._mqtt_client and self._mqtt_client.connected:
+                    try:
+                        await self._mqtt_client.upload_workload_results(
+                            workload_uuid=workload.workload_uuid,
+                            filenames=filenames,
+                            signed_urls=signed_urls,
+                            attachment_uuids=attachment_uuids,
+                        )
+                        logger.info(
+                            f"Notified backend via MQTT about {len(uploaded_files)} uploaded file(s) "
+                            f"for workload {workload.workload_uuid}"
+                        )
+                    except (MQTTError, asyncio.TimeoutError) as e:
+                        logger.warning(
+                            f"MQTT upload results notification failed: {e}. "
+                            "Falling back to HTTP."
+                        )
+                        # Fall back to HTTP (if available)
+                        try:
+                            self.client.upload_workload_results(
+                                workload_uuid=workload.workload_uuid,
+                                filenames=filenames,
+                                signed_urls=signed_urls,
+                                attachment_uuids=attachment_uuids,
+                            )
+                            logger.info(
+                                f"Notified backend via HTTP about {len(uploaded_files)} uploaded file(s) "
+                                f"for workload {workload.workload_uuid}"
+                            )
+                        except Exception as http_e:
+                            logger.error(
+                                f"HTTP upload results notification also failed: {http_e}. "
+                                "Results uploaded but backend not notified."
+                            )
+                else:
+                    # Use HTTP client
+                    try:
+                        self.client.upload_workload_results(
+                            workload_uuid=workload.workload_uuid,
+                            filenames=filenames,
+                            signed_urls=signed_urls,
+                            attachment_uuids=attachment_uuids,
+                        )
+                        logger.info(
+                            f"Notified backend via HTTP about {len(uploaded_files)} uploaded file(s) "
+                            f"for workload {workload.workload_uuid}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"HTTP upload results notification failed: {e}. "
+                            "Results uploaded but backend not notified."
+                        )
+            except Exception as e:
+                logger.error(
+                    f"Failed to notify backend about upload results: {e}. "
+                    "Results uploaded but backend not notified."
+                )
+
+        # Step 3e: Log upload completion summary
         if failed_count:
             logger.warning(
                 f"Upload complete with failures: {uploaded_count} succeeded, {failed_count} failed"
             )
         else:
-            logger.info(
-                f"Upload complete: {uploaded_count} succeeded, {failed_count} failed"
-            )
+            logger.info(f"Upload complete: {uploaded_count} succeeded, {failed_count} failed")
+
+        return {
+            "files_found": True,
+            "uploaded_count": uploaded_count,
+            "failed_count": failed_count,
+        }
 
     async def _register_via_mqtt(self) -> None:
         """Register this node with the Cyberwave backend via MQTT.
