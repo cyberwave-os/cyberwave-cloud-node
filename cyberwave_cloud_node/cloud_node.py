@@ -1042,11 +1042,13 @@ class CloudNode:
                     break
                 yield chunk
 
-    async def _handle_workload_completion(self, workload: ActiveWorkload, exit_code: int | None = None) -> None:
+    async def _handle_workload_completion(
+        self, workload: ActiveWorkload, exit_code: int | None = None
+    ) -> None:
         """Handle completion of a workload process.
 
         Collects output, determines exit code, and publishes results.
-        
+
         Args:
             workload: The completed workload
             exit_code: Optional exit code if already captured (to avoid race conditions)
@@ -1270,14 +1272,20 @@ class CloudNode:
                         # Prefer MQTT if available, fall back to HTTP
                         if self._mqtt_client and self._mqtt_client.connected:
                             try:
-                                signed_url_response = await self._mqtt_client.request_signed_url_for_attachment(
-                                    workload_uuid=workload.workload_uuid,
-                                    filename=filename,
+                                signed_url_response = (
+                                    await self._mqtt_client.request_signed_url_for_attachment(
+                                        workload_uuid=workload.workload_uuid,
+                                        filename=filename,
+                                    )
                                 )
                                 signed_url = signed_url_response.payload.get("signed_url")
                                 # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
                                 response_filename = signed_url_response.payload.get("filename", "")
-                                attachment_uuid = os.path.splitext(response_filename)[0] if response_filename else None
+                                attachment_uuid = (
+                                    os.path.splitext(response_filename)[0]
+                                    if response_filename
+                                    else None
+                                )
                             except (MQTTError, asyncio.TimeoutError) as e:
                                 logger.warning(
                                     f"MQTT signed URL request failed for {filename}: {e}. "
@@ -1291,7 +1299,11 @@ class CloudNode:
                                 signed_url = signed_url_response.get("signed_url")
                                 # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
                                 response_filename = signed_url_response.get("filename", "")
-                                attachment_uuid = os.path.splitext(response_filename)[0] if response_filename else None
+                                attachment_uuid = (
+                                    os.path.splitext(response_filename)[0]
+                                    if response_filename
+                                    else None
+                                )
                         else:
                             # Use HTTP client
                             signed_url_response = self.client.get_signed_url_for_attachment(
@@ -1301,7 +1313,11 @@ class CloudNode:
                             signed_url = signed_url_response.get("signed_url")
                             # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
                             response_filename = signed_url_response.get("filename", "")
-                            attachment_uuid = os.path.splitext(response_filename)[0] if response_filename else None
+                            attachment_uuid = (
+                                os.path.splitext(response_filename)[0]
+                                if response_filename
+                                else None
+                            )
 
                         if not signed_url:
                             raise CloudNodeClientError(f"No signed URL returned for {filename}")
@@ -1324,11 +1340,13 @@ class CloudNode:
                             file_uploaded = True
                             # Track successful upload for result notification and deletion
                             if attachment_uuid and signed_url:
-                                uploaded_files.append({
-                                    "filename": filename,
-                                    "signed_url": signed_url,
-                                    "attachment_uuid": attachment_uuid,
-                                })
+                                uploaded_files.append(
+                                    {
+                                        "filename": filename,
+                                        "signed_url": signed_url,
+                                        "attachment_uuid": attachment_uuid,
+                                    }
+                                )
                                 successfully_uploaded_paths.append(file_path)
                             break
 
@@ -1397,8 +1415,7 @@ class CloudNode:
                         backend_notified = True
                     except (MQTTError, asyncio.TimeoutError) as e:
                         logger.warning(
-                            f"MQTT upload results notification failed: {e}. "
-                            "Falling back to HTTP."
+                            f"MQTT upload results notification failed: {e}. Falling back to HTTP."
                         )
                         # Fall back to HTTP (if available)
                         try:
@@ -1457,7 +1474,9 @@ class CloudNode:
                 except Exception as e:
                     logger.warning(f"Failed to delete uploaded file {file_path}: {e}")
             if deleted_count > 0:
-                logger.info(f"Deleted {deleted_count} successfully uploaded file(s) after backend notification")
+                logger.info(
+                    f"Deleted {deleted_count} successfully uploaded file(s) after backend notification"
+                )
 
         # Step 3e: Log upload completion summary
         if failed_count:
