@@ -620,6 +620,13 @@ class CloudNodeClient:
                 "No instance identity found. Call register() first or provide slug/instance_uuid."
             )
 
+        # Backend log endpoint is instance UUID scoped: /api/v1/cloud-node/{uuid}/log
+        if not instance_uuid:
+            raise CloudNodeClientError(
+                "instance_uuid is required to send logs (backend requires UUID in URL path). "
+                "Call register() first or set CYBERWAVE_CLOUD_NODE_INSTANCE_UUID."
+            )
+
         payload = {
             "log_type": log_type,
             "log_content": log_content,
@@ -634,7 +641,8 @@ class CloudNodeClient:
             payload["workspace_slug"] = ws_slug
 
         try:
-            response = self._client.post(CLOUD_NODE_LOG_ENDPOINT, json=payload)
+            endpoint = CLOUD_NODE_LOG_ENDPOINT.format(uuid=instance_uuid)
+            response = self._client.post(endpoint, json=payload)
 
             if response.status_code == 200:
                 return LogResponse.from_dict(response.json())

@@ -17,7 +17,7 @@ CLOUD_NODE_REGISTER_ENDPOINT = "/api/v1/cloud-node/{uuid}/register"
 CLOUD_NODE_HEARTBEAT_ENDPOINT = "/api/v1/cloud-node/{uuid}/heartbeat"
 CLOUD_NODE_TERMINATED_ENDPOINT = "/api/v1/cloud-node/terminated"
 CLOUD_NODE_FAILED_ENDPOINT = "/api/v1/cloud-node/failed"
-CLOUD_NODE_LOG_ENDPOINT = "/api/v1/cloud-node/log"
+CLOUD_NODE_LOG_ENDPOINT = "/api/v1/cloud-node/{uuid}/log"
 CLOUD_NODE_WORKLOAD_UPDATE_ENDPOINT = "/api/v1/cloud-node/workload/{uuid}/update"
 CLOUD_NODE_WORKLOAD_COMPLETE_ENDPOINT = "/api/v1/cloud-node/workload/{uuid}/complete"
 CLOUD_NODE_WORKLOAD_FAIL_ENDPOINT = "/api/v1/cloud-node/workload/{uuid}/fail"
@@ -133,12 +133,12 @@ def get_mqtt_port() -> int:
 
 def get_mqtt_username() -> Optional[str]:
     """Get MQTT username from environment."""
-    return os.getenv("CYBERWAVE_MQTT_USERNAME")
+    return get_instance_uuid()
 
 
 def get_mqtt_password() -> Optional[str]:
     """Get MQTT password from environment."""
-    return os.getenv("CYBERWAVE_MQTT_PASSWORD")
+    return os.getenv("CYBERWAVE_API_TOKEN")
 
 
 @dataclass
