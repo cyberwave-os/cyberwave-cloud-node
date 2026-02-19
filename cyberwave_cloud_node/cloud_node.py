@@ -688,19 +688,23 @@ class CloudNode:
             async with self._workload_lock:
                 self._active_workloads.pop(workload.pid, None)
 
-            # Publish cancellation notification to the workload's original request
-            self._publish_response(
-                workload.request_id,
-                success=False,
-                error=f"Workload cancelled by {signal_name}",
-                output=json.dumps(
-                    {
-                        "status": "cancelled",
-                        "signal": signal_name,
-                        "pid": workload.pid,
-                    }
-                ),
-            )
+            # Notify backend via the workload status channel so the workload is
+            # properly marked as FAILED rather than staying RUNNING forever.
+            if workload.workload_uuid and self._mqtt_client:
+                try:
+                    await self._mqtt_client.update_workload_status(
+                        workload_uuid=workload.workload_uuid,
+                        status="failed",
+                        additional_data={
+                            "message": f"Workload cancelled by {signal_name}",
+                            "signal": signal_name,
+                            "pid": workload.pid,
+                        },
+                    )
+                except Exception as notify_err:
+                    logger.warning(
+                        f"Failed to notify backend of workload cancellation: {notify_err}"
+                    )
 
             return True, f"Workload cancelled with {signal_name}"
 
@@ -960,13 +964,53 @@ class CloudNode:
                 else:
                     # Process completed while we were down - handle orphaned results
                     logger.info(f"Workload PID {pid} completed while service was down")
-                    # await self._handle_orphaned_completion(data)
+                    await self._handle_orphaned_completion(data)
 
             logger.info(f"Recovered {len(self._active_workloads)} active workload(s)")
 
         except Exception as e:
             logger.error(f"Failed to recover workload state: {e}", exc_info=True)
             raise
+
+    async def _handle_orphaned_completion(self, data: dict) -> None:
+        """Handle a workload that finished while the Cloud Node was restarting.
+
+        Reconstructs an ActiveWorkload from the persisted state and delegates
+        to the standard completion handler so uploads and backend notifications
+        run exactly as they would for a live workload.
+
+        Args:
+            data: Raw dict from active_workloads.json for a single workload entry.
+        """
+        workload_uuid = data.get("workload_uuid")
+        pid = int(data.get("pid", 0))
+
+        if not workload_uuid:
+            logger.warning(
+                f"Orphaned workload PID {pid} has no workload_uuid; "
+                "skipping backend notification"
+            )
+            return
+
+        logger.info(
+            f"Handling orphaned completion for workload {workload_uuid} (PID {pid})"
+        )
+
+        workload = ActiveWorkload(
+            pid=pid,
+            request_id=data.get("request_id"),
+            workload_type=data.get("workload_type", "unknown"),
+            started_at=data.get("started_at", time.time()),
+            command=data.get("command", ""),
+            stdout_file=Path(data["stdout_file"]),
+            stderr_file=Path(data["stderr_file"]),
+            params=data.get("params", {}),
+            workload_uuid=workload_uuid,
+        )
+
+        # exit_code is unknown — _handle_workload_completion will infer success
+        # from stdout content heuristics.
+        await self._handle_workload_completion(workload, exit_code=None)
 
     async def _workload_monitor_loop(self) -> None:
         """Monitor active workload processes and collect results when they complete.
