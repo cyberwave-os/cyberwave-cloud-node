@@ -57,11 +57,11 @@ Behind the scenes, Cyberwave Cloud Node will take care of:
 
 The Cloud Node needs an API token to communicate with Cyberwave. You can provide it in several ways (in order of priority):
 
-1. **Environment variable**: `export CYBERWAVE_TOKEN=your-token`
+1. **Environment variable**: `export CYBERWAVE_API_KEY=your-token`
 2. **`.env` file** in current directory:
    ```bash
    # .env
-   CYBERWAVE_TOKEN=your-token
+   CYBERWAVE_API_KEY=your-token
    CYBERWAVE_WORKSPACE_SLUG=my-workspace
    ```
 3. **`.env` file** in `~/.cyberwave/.env` (shared config)
@@ -73,7 +73,7 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 
 ### Required
 
-- `CYBERWAVE_TOKEN`: Your Cyberwave API token
+- `CYBERWAVE_API_KEY`: Your Cyberwave API token
 
 ### Optional - API & Workspace
 
@@ -102,7 +102,7 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 
 ```bash
 # Start the cloud node (backend assigns UUID and slug)
-export CYBERWAVE_TOKEN=your-token-here
+export CYBERWAVE_API_KEY=your-token-here
 cyberwave-cloud-node start
 
 # With a slug hint (backend may use this or assign a different one)

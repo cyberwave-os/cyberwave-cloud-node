@@ -65,10 +65,10 @@ def get_api_token() -> Optional[str]:
     """Get the API token from environment or stored credentials.
 
     Priority:
-    1. CYBERWAVE_TOKEN environment variable
+    1. CYBERWAVE_API_KEY environment variable
     2. Stored credentials in ~/.cyberwave/credentials.json
     """
-    token = os.getenv("CYBERWAVE_TOKEN")
+    token = os.getenv("CYBERWAVE_API_KEY")
     if token:
         return token
 
@@ -138,7 +138,7 @@ def get_mqtt_username() -> Optional[str]:
 
 def get_mqtt_password() -> Optional[str]:
     """Get MQTT password from environment."""
-    return os.getenv("CYBERWAVE_TOKEN")
+    return os.getenv("CYBERWAVE_API_KEY")
 
 
 @dataclass

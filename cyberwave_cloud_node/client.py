@@ -145,7 +145,7 @@ class CloudNodeClient:
 
         Args:
             base_url: API base URL. Defaults to CYBERWAVE_BASE_URL env var or https://api.cyberwave.com
-            token: API token. Defaults to CYBERWAVE_TOKEN env var
+            token: API token. Defaults to CYBERWAVE_API_KEY env var
             workspace_slug: Workspace slug. Defaults to CYBERWAVE_WORKSPACE_SLUG env var
         """
         self.base_url = base_url or get_api_url()
@@ -154,7 +154,7 @@ class CloudNodeClient:
 
         if not self.token:
             raise CloudNodeClientError(
-                "API token is required. Set CYBERWAVE_TOKEN environment variable "
+                "API token is required. Set CYBERWAVE_API_KEY environment variable "
                 "or pass token to CloudNodeClient."
             )
 
