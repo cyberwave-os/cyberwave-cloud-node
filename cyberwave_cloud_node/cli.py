@@ -153,7 +153,7 @@ def start_node(args: argparse.Namespace) -> int:
     if not get_api_token():
         logger.error(
             "API token is required. You can provide it via:\n"
-            "  1. CYBERWAVE_API_TOKEN environment variable\n"
+            "  1. CYBERWAVE_TOKEN environment variable\n"
             "  2. .env file in current directory or ~/.cyberwave/.env\n"
             "  3. Login with cyberwave-cli (stores in ~/.cyberwave/credentials.json)\n\n"
             "Get your token from https://cyberwave.com/profile"

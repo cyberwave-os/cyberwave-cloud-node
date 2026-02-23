@@ -11,14 +11,14 @@ Basic Usage:
     node.run()
 
 Authentication (in order of priority):
-    1. CYBERWAVE_API_TOKEN environment variable
+    1. CYBERWAVE_TOKEN environment variable
     2. .env file in current directory
     3. .env file in ~/.cyberwave/
     4. Stored credentials from cyberwave-cli (~/.cyberwave/credentials.json)
 
 Environment Variables:
-    CYBERWAVE_API_URL: API base URL (default: https://api.cyberwave.com)
-    CYBERWAVE_API_TOKEN: Your Cyberwave API token
+    CYBERWAVE_BASE_URL: API base URL (default: https://api.cyberwave.com)
+    CYBERWAVE_TOKEN: Your Cyberwave API token
     CYBERWAVE_WORKSPACE_SLUG: Your workspace slug (optional)
     CYBERWAVE_INSTANCE_SLUG: Instance slug hint (optional, for automated deployments)
 """

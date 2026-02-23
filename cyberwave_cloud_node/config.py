@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from . import credentials as creds_module  # noqa: E402
 
 # API Configuration
-DEFAULT_API_URL = "https://api.cyberwave.com"
+DEFAULT_BASE_URL = "https://api.cyberwave.com"
 CLOUD_NODE_CREATE_INSTANCE_ENDPOINT = "/api/v1/cloud-node"
 CLOUD_NODE_REGISTER_ENDPOINT = "/api/v1/cloud-node/{uuid}/register"
 CLOUD_NODE_HEARTBEAT_ENDPOINT = "/api/v1/cloud-node/{uuid}/heartbeat"
@@ -57,18 +57,18 @@ def load_dotenv_files(working_dir: Optional[Path] = None) -> None:
 
 
 def get_api_url() -> str:
-    """Get the API URL from environment or default."""
-    return os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    """Get the backend base URL from environment or default."""
+    return os.getenv("CYBERWAVE_BASE_URL", DEFAULT_BASE_URL)
 
 
 def get_api_token() -> Optional[str]:
     """Get the API token from environment or stored credentials.
 
     Priority:
-    1. CYBERWAVE_API_TOKEN environment variable
+    1. CYBERWAVE_TOKEN environment variable
     2. Stored credentials in ~/.cyberwave/credentials.json
     """
-    token = os.getenv("CYBERWAVE_API_TOKEN")
+    token = os.getenv("CYBERWAVE_TOKEN")
     if token:
         return token
 
@@ -138,7 +138,7 @@ def get_mqtt_username() -> Optional[str]:
 
 def get_mqtt_password() -> Optional[str]:
     """Get MQTT password from environment."""
-    return os.getenv("CYBERWAVE_API_TOKEN")
+    return os.getenv("CYBERWAVE_TOKEN")
 
 
 @dataclass

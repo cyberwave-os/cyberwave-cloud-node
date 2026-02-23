@@ -270,7 +270,7 @@ class CloudNode:
         token = get_api_token()
         if not token:
             raise CloudNodeError(
-                "API token is required. Set CYBERWAVE_API_TOKEN environment variable."
+                "API token is required. Set CYBERWAVE_TOKEN environment variable."
             )
 
         self._mqtt_client = CloudNodeMQTTClient(
