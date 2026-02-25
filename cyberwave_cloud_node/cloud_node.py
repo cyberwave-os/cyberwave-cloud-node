@@ -281,6 +281,8 @@ class CloudNode:
             keepalive=60,
             topic_prefix=self._topic_prefix,
             api_token=token,
+            use_tls=self.config.mqtt_use_tls,
+            tls_ca_certs=self.config.mqtt_tls_ca_certs,
         )
 
         try:

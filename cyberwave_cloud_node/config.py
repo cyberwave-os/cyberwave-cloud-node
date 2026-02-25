@@ -131,6 +131,34 @@ def get_mqtt_port() -> int:
     return int(os.getenv("CYBERWAVE_MQTT_PORT", str(DEFAULT_MQTT_PORT)))
 
 
+def _parse_bool(value: str, default: bool) -> bool:
+    """Parse a boolean-like string value with a default fallback."""
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def get_mqtt_use_tls() -> bool:
+    """Get MQTT TLS toggle from environment.
+
+    If CYBERWAVE_MQTT_USE_TLS is not set, TLS defaults to enabled when the MQTT
+    port is 8883.
+    """
+    raw = os.getenv("CYBERWAVE_MQTT_USE_TLS")
+    if raw is not None:
+        return _parse_bool(raw, default=False)
+    return get_mqtt_port() == 8883
+
+
+def get_mqtt_tls_ca_certs() -> Optional[str]:
+    """Get optional CA certificate bundle path for MQTT TLS."""
+    value = os.getenv("CYBERWAVE_MQTT_TLS_CA_CERTS")
+    return value if value else None
+
+
 def get_mqtt_username() -> Optional[str]:
     """Get MQTT username from environment."""
     return get_instance_uuid()
@@ -155,6 +183,8 @@ class CloudNodeConfig:
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
     mqtt_host: str = DEFAULT_MQTT_HOST
     mqtt_port: int = DEFAULT_MQTT_PORT
+    mqtt_use_tls: bool = False
+    mqtt_tls_ca_certs: Optional[str] = None
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
     upload_results: bool = True  # Whether to upload result files after workload completion
@@ -165,6 +195,8 @@ class CloudNodeConfig:
     def from_dict(cls, data: dict) -> "CloudNodeConfig":
         """Create config from a dictionary."""
         cloud_node_data = data.get("cyberwave-cloud-node", data)
+        mqtt_port = cloud_node_data.get("mqtt_port", get_mqtt_port())
+        mqtt_use_tls = cloud_node_data.get("mqtt_use_tls", mqtt_port == 8883)
 
         return cls(
             install_script=cloud_node_data.get("install_script"),
@@ -175,7 +207,11 @@ class CloudNodeConfig:
                 "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL
             ),
             mqtt_host=cloud_node_data.get("mqtt_host", get_mqtt_host()),
-            mqtt_port=cloud_node_data.get("mqtt_port", get_mqtt_port()),
+            mqtt_port=mqtt_port,
+            mqtt_use_tls=mqtt_use_tls,
+            mqtt_tls_ca_certs=cloud_node_data.get(
+                "mqtt_tls_ca_certs", get_mqtt_tls_ca_certs()
+            ),
             mqtt_username=cloud_node_data.get("mqtt_username", get_mqtt_username()),
             mqtt_password=cloud_node_data.get("mqtt_password", get_mqtt_password()),
             upload_results=cloud_node_data.get("upload_results", True),
@@ -192,6 +228,8 @@ class CloudNodeConfig:
                     "heartbeat_interval",
                     "mqtt_host",
                     "mqtt_port",
+                    "mqtt_use_tls",
+                    "mqtt_tls_ca_certs",
                     "mqtt_username",
                     "mqtt_password",
                     "upload_results",
@@ -250,6 +288,8 @@ class CloudNodeConfig:
             ),
             mqtt_host=get_mqtt_host(),
             mqtt_port=get_mqtt_port(),
+            mqtt_use_tls=get_mqtt_use_tls(),
+            mqtt_tls_ca_certs=get_mqtt_tls_ca_certs(),
             mqtt_username=get_mqtt_username(),
             mqtt_password=get_mqtt_password(),
             upload_results=os.getenv("CYBERWAVE_UPLOAD_RESULTS", "true").lower() == "true",

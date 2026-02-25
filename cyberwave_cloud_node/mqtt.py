@@ -10,6 +10,7 @@ This module handles MQTT v5 communication with request/response patterns:
 import asyncio
 import json
 import logging
+import ssl
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -59,6 +60,8 @@ class CloudNodeMQTTClient:
         client_id: Optional[str] = None,
         topic_prefix: str = "",
         api_token: Optional[str] = None,
+        use_tls: bool = False,
+        tls_ca_certs: Optional[str] = None,
     ):
         """Initialize MQTT client.
 
@@ -71,6 +74,8 @@ class CloudNodeMQTTClient:
             client_id: Client ID (auto-generated if not provided)
             topic_prefix: Prefix for all topics (for environment separation)
             api_token: Cyberwave API token for user authentication (optional)
+            use_tls: Whether to use TLS for MQTT broker connection
+            tls_ca_certs: Optional CA certificate bundle path for TLS verification
         """
         self.host = host
         self.port = port
@@ -79,6 +84,8 @@ class CloudNodeMQTTClient:
         self.keepalive = keepalive
         self.topic_prefix = topic_prefix
         self.api_token = api_token
+        self.use_tls = use_tls
+        self.tls_ca_certs = tls_ca_certs
 
         # Generate client ID if not provided
         if not client_id:
@@ -94,6 +101,13 @@ class CloudNodeMQTTClient:
         # Set authentication
         if username and password:
             self._client.username_pw_set(username, password)
+
+        if self.use_tls:
+            self._client.tls_set(
+                ca_certs=self.tls_ca_certs,
+                cert_reqs=ssl.CERT_REQUIRED,
+                tls_version=ssl.PROTOCOL_TLS_CLIENT,
+            )
 
         # Connection state
         self._connected = False
