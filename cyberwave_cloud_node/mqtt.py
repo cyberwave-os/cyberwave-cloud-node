@@ -8,6 +8,7 @@ This module handles MQTT v5 communication with request/response patterns:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import ssl
@@ -116,6 +117,9 @@ class CloudNodeMQTTClient:
 
         # Pending requests (for request/response pattern)
         self._pending_requests: dict[bytes, asyncio.Future[MQTTResponse]] = {}
+        self._command_callbacks: dict[
+            str, Callable[[dict[str, Any], Optional[Properties]], None]
+        ] = {}
 
         # Response topic for this client
         self._response_topic = f"{self.topic_prefix}cyberwave/response/{client_id}"
@@ -139,6 +143,7 @@ class CloudNodeMQTTClient:
             # Subscribe to our response topic for request/response pattern
             client.subscribe(self._response_topic, qos=1)
             logger.info(f"Subscribed to response topic: {self._response_topic}")
+            self._resubscribe_command_topics()
 
             if self._loop:
                 self._loop.call_soon_threadsafe(self._connect_event.set)
@@ -359,6 +364,16 @@ class CloudNodeMQTTClient:
         if not self._connected:
             raise MQTTError("Not connected to MQTT broker")
 
+        self._command_callbacks[topic] = callback
+        self._subscribe_command_topic(topic, callback)
+
+    def _subscribe_command_topic(
+        self,
+        topic: str,
+        callback: Callable[[dict[str, Any], Optional[Properties]], None],
+    ) -> None:
+        """Subscribe a single command topic and register its callback."""
+
         def message_callback(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
             """Wrapper callback for command messages."""
             try:
@@ -376,6 +391,8 @@ class CloudNodeMQTTClient:
                 logger.error(f"Error in command callback: {e}", exc_info=True)
 
         # Subscribe to topic
+        with contextlib.suppress(Exception):
+            self._client.message_callback_remove(topic)
         self._client.message_callback_add(topic, message_callback)
         result = self._client.subscribe(topic, qos=1)
 
@@ -383,6 +400,19 @@ class CloudNodeMQTTClient:
             raise MQTTError(f"Failed to subscribe to {topic}")
 
         logger.info(f"Subscribed to command topic: {topic}")
+
+    def _resubscribe_command_topics(self) -> None:
+        """Re-subscribe all remembered command topics after reconnect."""
+        for topic, callback in self._command_callbacks.items():
+            try:
+                self._subscribe_command_topic(topic, callback)
+            except MQTTError as exc:
+                logger.error(
+                    "Failed to re-subscribe to command topic %s after reconnect: %s",
+                    topic,
+                    exc,
+                    exc_info=True,
+                )
 
     async def request_instance(
         self,
