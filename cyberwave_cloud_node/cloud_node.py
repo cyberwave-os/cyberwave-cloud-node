@@ -1673,9 +1673,6 @@ class CloudNode:
                     try:
                         await self._mqtt_client.connect()
                         logger.info("MQTT reconnected successfully")
-                        # Re-subscribe to command topics after reconnection
-                        if self.instance_uuid:
-                            await self._subscribe_to_commands()
                     except MQTTError as reconnect_error:
                         logger.error(
                             f"Failed to reconnect to MQTT: {reconnect_error}", exc_info=True
