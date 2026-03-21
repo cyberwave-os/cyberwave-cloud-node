@@ -32,6 +32,7 @@ Then to the root of your repository you add a yaml file like this
 cyberwave-cloud-node:
   install_script: ./install.sh          # install what you need in the cloud GPU
   inference: python ./inference.py --params {body}  # {body} renders to JSON params from MQTT
+  simulate: python ./simulate.py --params {body}
   training: python ./training.py --params {body}
   profile_slug: gpu-a100                # optional: node profile (default: "default")
   heartbeat_interval: 30                # optional: heartbeat interval in seconds
@@ -93,6 +94,7 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 
 - `CYBERWAVE_INSTALL_SCRIPT`: Install script command
 - `CYBERWAVE_INFERENCE_CMD`: Inference command template
+- `CYBERWAVE_SIMULATE_CMD`: Simulation command template
 - `CYBERWAVE_TRAINING_CMD`: Training command template
 - `CYBERWAVE_PROFILE_SLUG`: Node profile slug (default: "default")
 - `CYBERWAVE_HEARTBEAT_INTERVAL`: Heartbeat interval in seconds (default: 30)
@@ -190,6 +192,7 @@ The cloud node subscribes to command topics and publishes responses:
 Supported commands:
 
 - `inference` - Run the inference command
+- `simulate` - Run the simulation command
 - `training` - Run the training command
 - `status` - Get node status (includes active workloads)
 - `cancel` - Cancel a running workload by PID or request_id
@@ -351,3 +354,14 @@ These files are also streamed to the backend in real-time for live monitoring.
 
 - Try it on a real repo - I cloned https://github.com/cyberwave-os/openvla-oft into this workspace
 - Add a Nuitka github action to build it as a binary
+
+## MuJoCo Docker Example
+
+Inside this monorepo there is a runnable local example for the `simulate`
+command at `cyberwave-cloud-nodes/tests/mujoco-sim/`. It starts:
+
+- a `cyberwave-cloud-node` worker container
+- a MuJoCo simulator container
+
+Use that example when you want your local machine to behave like a real
+simulation cloud node with minimal manual setup.

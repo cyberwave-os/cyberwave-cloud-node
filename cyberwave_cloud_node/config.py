@@ -179,6 +179,7 @@ class CloudNodeConfig:
     install_script: Optional[str] = None
     inference: Optional[str] = None
     training: Optional[str] = None
+    simulate: Optional[str] = None
     profile_slug: str = "default"
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
     mqtt_host: str = DEFAULT_MQTT_HOST
@@ -202,6 +203,7 @@ class CloudNodeConfig:
             install_script=cloud_node_data.get("install_script"),
             inference=cloud_node_data.get("inference"),
             training=cloud_node_data.get("training"),
+            simulate=cloud_node_data.get("simulate"),
             profile_slug=cloud_node_data.get("profile_slug", "default"),
             heartbeat_interval=cloud_node_data.get(
                 "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL
@@ -224,6 +226,7 @@ class CloudNodeConfig:
                     "install_script",
                     "inference",
                     "training",
+                    "simulate",
                     "profile_slug",
                     "heartbeat_interval",
                     "mqtt_host",
@@ -282,6 +285,7 @@ class CloudNodeConfig:
             install_script=os.getenv("CYBERWAVE_INSTALL_SCRIPT"),
             inference=os.getenv("CYBERWAVE_INFERENCE_CMD"),
             training=os.getenv("CYBERWAVE_TRAINING_CMD"),
+            simulate=os.getenv("CYBERWAVE_SIMULATE_CMD"),
             profile_slug=os.getenv("CYBERWAVE_PROFILE_SLUG", "default"),
             heartbeat_interval=int(
                 os.getenv("CYBERWAVE_HEARTBEAT_INTERVAL", str(DEFAULT_HEARTBEAT_INTERVAL))

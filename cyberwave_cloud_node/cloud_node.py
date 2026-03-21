@@ -22,6 +22,7 @@ import shlex
 import signal
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
@@ -117,6 +118,7 @@ class CloudNode:
         # Instance UUID can come from environment (e.g., set by Terraform) or will be
         # assigned by the backend during registration. Check environment first.
         self.instance_uuid: str = get_instance_uuid() or ""
+        self._generated_mqtt_username = f"cloud-node-bootstrap-{uuid.uuid4().hex[:8]}"
 
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -276,7 +278,7 @@ class CloudNode:
         self._mqtt_client = CloudNodeMQTTClient(
             host=self.config.mqtt_host,
             port=self.config.mqtt_port,
-            username=self.config.mqtt_username,
+            username=self._resolve_mqtt_username(),
             password=self.config.mqtt_password,
             keepalive=60,
             topic_prefix=self._topic_prefix,
@@ -291,6 +293,15 @@ class CloudNode:
         except MQTTError as e:
             logger.error(f"Failed to connect to MQTT broker: {e}", exc_info=True)
             raise CloudNodeError(f"MQTT connection failed: {e}") from e
+
+    def _resolve_mqtt_username(self) -> str:
+        """Resolve a non-empty MQTT username for bootstrap and reconnect flows."""
+        return (
+            self.config.mqtt_username
+            or self.instance_uuid
+            or self.slug
+            or self._generated_mqtt_username
+        )
 
     async def _subscribe_to_commands(self) -> None:
         """Subscribe to MQTT topics for receiving workload commands."""
@@ -336,6 +347,11 @@ class CloudNode:
                         if self._event_loop:
                             asyncio.run_coroutine_threadsafe(
                                 self._handle_inference(params, request_id), self._event_loop
+                            )
+                    case "simulate":
+                        if self._event_loop:
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_simulate(params, request_id), self._event_loop
                             )
                     case "training":
                         if self._event_loop:
@@ -496,6 +512,43 @@ class CloudNode:
                 error=f"Failed to start training: {str(e)}",
             )
 
+    async def _handle_simulate(self, params: dict, request_id: Optional[str]) -> None:
+        """Handle a simulate command by spawning a detached process."""
+        try:
+            if not self.config.simulate:
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error="Simulate command not configured in cyberwave.yml",
+                )
+                return
+
+            if self._is_node_busy():
+                logger.warning(
+                    f"Node is busy with {self._get_active_workload_count()} active workload(s). "
+                    f"Rejecting simulate request {request_id}"
+                )
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error=f"Node is busy with {self._get_active_workload_count()} active workload(s)",
+                )
+                return
+
+            logger.info(f"Starting simulate workload (request_id: {request_id})")
+            await self._spawn_workload_process("simulate", params, request_id)
+
+        except Exception as e:
+            logger.error(
+                f"Error starting simulate command (request_id: {request_id}): {e}",
+                exc_info=True,
+            )
+            self._publish_response(
+                request_id,
+                success=False,
+                error=f"Failed to start simulate: {str(e)}",
+            )
+
     async def _handle_status(self, request_id: Optional[str]) -> None:
         """Handle a status query."""
         async with self._workload_lock:
@@ -518,6 +571,7 @@ class CloudNode:
                     "instance_uuid": self.instance_uuid,
                     "profile_slug": self.config.profile_slug,
                     "has_inference": bool(self.config.inference),
+                    "has_simulate": bool(self.config.simulate),
                     "has_training": bool(self.config.training),
                     "is_busy": self._is_node_busy(),
                     "active_workloads": active_workloads_info,
@@ -549,6 +603,8 @@ class CloudNode:
         match command_type:
             case "inference":
                 await self._handle_inference(command_params, request_id)
+            case "simulate":
+                await self._handle_simulate(command_params, request_id)
             case "training":
                 await self._handle_training(command_params, request_id)
             case _:
@@ -754,9 +810,14 @@ class CloudNode:
         to log files and will be collected when the process completes.
         """
         # Build command
-        command_template = (
-            self.config.inference if workload_type == "inference" else self.config.training
-        )
+        command_map = {
+            "inference": self.config.inference,
+            "simulate": self.config.simulate,
+            "training": self.config.training,
+        }
+        command_template = command_map.get(workload_type)
+        if not command_template:
+            raise CloudNodeError(f"No command configured for workload type: {workload_type}")
 
         # Create output files for this workload
         timestamp = int(time.time())

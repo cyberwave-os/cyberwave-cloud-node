@@ -188,6 +188,8 @@ def start_node(args: argparse.Namespace) -> int:
         logger.info(f"MQTT Broker: {config.mqtt_host}:{config.mqtt_port}")
         if config.inference:
             logger.info(f"Inference command: {config.inference}")
+        if config.simulate:
+            logger.info(f"Simulate command: {config.simulate}")
         if config.training:
             logger.info(f"Training command: {config.training}")
 

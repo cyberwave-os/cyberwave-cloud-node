@@ -6,7 +6,15 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, call, patch
 
-import paho.mqtt.client as mqtt  # pyright: ignore[reportMissingImports]
+try:
+    import paho.mqtt.client as mqtt  # pyright: ignore[reportMissingImports]
+except ModuleNotFoundError:
+    mqtt = SimpleNamespace(MQTT_ERR_SUCCESS=0, Client=Mock())
+    sys.modules.setdefault("paho", Mock())
+    sys.modules.setdefault("paho.mqtt", Mock())
+    sys.modules.setdefault("paho.mqtt.client", mqtt)
+    sys.modules.setdefault("paho.mqtt.packettypes", SimpleNamespace(PacketTypes=Mock()))
+    sys.modules.setdefault("paho.mqtt.properties", SimpleNamespace(Properties=Mock()))
 
 sys.modules.setdefault("psutil", Mock())
 sys.modules.setdefault("yaml", Mock())
@@ -29,6 +37,114 @@ from cyberwave_cloud_node.mqtt import CloudNodeMQTTClient
 
 
 class MQTTReconnectTests(unittest.TestCase):
+    def test_config_reads_simulate_command(self) -> None:
+        config = CloudNodeConfig.from_dict(
+            {
+                "cyberwave-cloud-node": {
+                    "simulate": "python run_mujoco_workload.py --params {body}"
+                }
+            }
+        )
+
+        self.assertEqual(
+            config.simulate, "python run_mujoco_workload.py --params {body}"
+        )
+
+    def test_connect_mqtt_uses_generated_bootstrap_username_when_identity_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(mqtt_password="api-token"),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            mock_mqtt_client = AsyncMock()
+            with (
+                patch(
+                    "cyberwave_cloud_node.cloud_node.get_api_token",
+                    return_value="api-token",
+                ),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.CloudNodeMQTTClient",
+                    return_value=mock_mqtt_client,
+                ) as mock_client_cls,
+            ):
+                asyncio.run(node._connect_mqtt())
+
+        self.assertTrue(mock_client_cls.called)
+        username = mock_client_cls.call_args.kwargs["username"]
+        self.assertTrue(username)
+        self.assertTrue(username.startswith("cloud-node-bootstrap-"))
+        mock_mqtt_client.connect.assert_awaited_once()
+
+    def test_connect_mqtt_prefers_slug_for_bootstrap_username(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(mqtt_password="api-token"),
+                    slug="mujoco-sim-worker",
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            mock_mqtt_client = AsyncMock()
+            with (
+                patch(
+                    "cyberwave_cloud_node.cloud_node.get_api_token",
+                    return_value="api-token",
+                ),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.CloudNodeMQTTClient",
+                    return_value=mock_mqtt_client,
+                ) as mock_client_cls,
+            ):
+                asyncio.run(node._connect_mqtt())
+
+        self.assertEqual(
+            mock_client_cls.call_args.kwargs["username"], "mujoco-sim-worker"
+        )
+        mock_mqtt_client.connect.assert_awaited_once()
+
+    def test_workload_received_dispatches_simulate_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            node._handle_simulate = AsyncMock()
+
+            asyncio.run(
+                node._handle_workload_received(
+                    {
+                        "workload_uuid": "workload-123",
+                        "command_type": "simulate",
+                        "command_params": {"environment_uuid": "env-123"},
+                    },
+                    "request-123",
+                )
+            )
+
+        node._handle_simulate.assert_awaited_once()
+        params, request_id = node._handle_simulate.await_args.args
+        self.assertEqual(request_id, "request-123")
+        self.assertEqual(params["environment_uuid"], "env-123")
+        self.assertEqual(params["workload_uuid"], "workload-123")
+
     def test_resubscribes_command_topics_on_reconnect(self) -> None:
         mock_paho_client = Mock()
         mock_paho_client.subscribe.return_value = (mqtt.MQTT_ERR_SUCCESS, 1)
