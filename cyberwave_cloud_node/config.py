@@ -160,7 +160,15 @@ def get_mqtt_tls_ca_certs() -> Optional[str]:
 
 
 def get_mqtt_username() -> Optional[str]:
-    """Get MQTT username from environment."""
+    """Get MQTT username from environment or stored identity.
+
+    Priority:
+    1. CYBERWAVE_MQTT_USERNAME environment variable
+    2. Stored instance UUID from identity
+    """
+    username = os.getenv("CYBERWAVE_MQTT_USERNAME")
+    if username:
+        return username
     return get_instance_uuid()
 
 

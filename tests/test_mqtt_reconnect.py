@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -49,6 +50,19 @@ class MQTTReconnectTests(unittest.TestCase):
         self.assertEqual(
             config.simulate, "python run_mujoco_workload.py --params {body}"
         )
+
+    def test_config_reads_mqtt_username_from_environment(self) -> None:
+        original = os.environ.get("CYBERWAVE_MQTT_USERNAME")
+        os.environ["CYBERWAVE_MQTT_USERNAME"] = "explicit-mqtt-username"
+        try:
+            config = CloudNodeConfig.from_dict({"cyberwave-cloud-node": {}})
+        finally:
+            if original is None:
+                del os.environ["CYBERWAVE_MQTT_USERNAME"]
+            else:
+                os.environ["CYBERWAVE_MQTT_USERNAME"] = original
+
+        self.assertEqual(config.mqtt_username, "explicit-mqtt-username")
 
     def test_connect_mqtt_uses_generated_bootstrap_username_when_identity_missing(
         self,
