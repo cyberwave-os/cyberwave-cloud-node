@@ -1720,7 +1720,7 @@ class CloudNode:
             await self._flush_logs()
 
     async def _mqtt_reconnect_loop(self) -> None:
-        """Monitor MQTT connection and reconnect if needed."""
+        """Monitor MQTT connection while the Paho network loop auto-reconnects."""
         logger.info("Starting MQTT reconnection monitoring loop")
         check_interval = 30  # Check every 30 seconds
 
@@ -1730,15 +1730,9 @@ class CloudNode:
             try:
                 # Check if MQTT is connected
                 if self._mqtt_client and not self._mqtt_client.connected:
-                    logger.warning("MQTT connection lost, attempting to reconnect...")
-                    try:
-                        await self._mqtt_client.connect()
-                        logger.info("MQTT reconnected successfully")
-                    except MQTTError as reconnect_error:
-                        logger.error(
-                            f"Failed to reconnect to MQTT: {reconnect_error}", exc_info=True
-                        )
-                        # Continue monitoring - will retry on next check
+                    logger.warning(
+                        "MQTT connection lost; waiting for client auto-reconnect..."
+                    )
             except Exception as e:
                 logger.error(f"Error checking MQTT connection status: {e}", exc_info=True)
                 # Don't crash - continue monitoring

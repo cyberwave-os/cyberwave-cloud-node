@@ -246,6 +246,8 @@ class CloudNodeMQTTClient:
     async def connect(self) -> None:
         """Connect to MQTT broker asynchronously."""
         self._loop = asyncio.get_running_loop()
+        self._connect_event.clear()
+        self._disconnect_event.clear()
 
         try:
             # Start the network loop in a separate thread

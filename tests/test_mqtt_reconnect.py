@@ -202,7 +202,7 @@ class MQTTReconnectTests(unittest.TestCase):
         mock_paho_client.message_callback_remove.assert_called_once_with(topic)
         self.assertEqual(mock_paho_client.message_callback_add.call_count, 1)
 
-    def test_mqtt_reconnect_loop_relies_on_client_resubscribe(self) -> None:
+    def test_mqtt_reconnect_loop_does_not_manually_reconnect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch(
                 "cyberwave_cloud_node.cloud_node.Path.home",
@@ -217,7 +217,6 @@ class MQTTReconnectTests(unittest.TestCase):
             node.instance_uuid = "instance-123"
             node._mqtt_client = Mock(connected=False)
             node._mqtt_client.connect = AsyncMock()
-            node._subscribe_to_commands = AsyncMock()
 
             async def fake_sleep(_: int) -> None:
                 node._running = False
@@ -228,8 +227,7 @@ class MQTTReconnectTests(unittest.TestCase):
             ):
                 asyncio.run(node._mqtt_reconnect_loop())
 
-        node._mqtt_client.connect.assert_awaited_once()
-        node._subscribe_to_commands.assert_not_called()
+        node._mqtt_client.connect.assert_not_awaited()
 
     def test_matches_response_correlation_data_when_bytearray(self) -> None:
         mock_paho_client = Mock()
