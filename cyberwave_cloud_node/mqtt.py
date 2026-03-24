@@ -25,6 +25,21 @@ from .config import get_api_token
 logger = logging.getLogger(__name__)
 
 
+def _normalize_correlation_data(value: Any) -> Optional[bytes]:
+    """Normalize MQTT correlation data to bytes for stable dictionary lookups."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, list):
+        return bytes(value)
+    return bytes(value)
+
+
 class MQTTError(Exception):
     """Raised when an MQTT operation fails."""
 
@@ -170,9 +185,28 @@ class CloudNodeMQTTClient:
 
             logger.debug(f"Received message on topic: {topic}")
 
+            if topic == self._response_topic:
+                logger.info(
+                    "Received MQTT response message on topic %s "
+                    "(topic_type=%s, properties_present=%s, payload_size=%s)",
+                    topic,
+                    type(topic).__name__,
+                    properties is not None,
+                    len(payload) if payload is not None else 0,
+                )
+
             # Check if this is a response to a pending request
             if topic == self._response_topic and properties:
-                correlation_data = getattr(properties, "CorrelationData", None)
+                raw_correlation_data = getattr(properties, "CorrelationData", None)
+                correlation_data = _normalize_correlation_data(raw_correlation_data)
+                logger.info(
+                    "Received MQTT response on topic %s with raw_correlation_type=%s "
+                    "normalized_correlation_length=%s pending_requests=%s",
+                    topic,
+                    type(raw_correlation_data).__name__,
+                    len(correlation_data) if correlation_data else 0,
+                    len(self._pending_requests),
+                )
                 if correlation_data and correlation_data in self._pending_requests:
                     # This is a response to one of our requests
                     future = self._pending_requests.pop(correlation_data)
@@ -193,6 +227,15 @@ class CloudNodeMQTTClient:
                     if self._loop:
                         self._loop.call_soon_threadsafe(future.set_result, response)
                     return
+
+                logger.warning(
+                    "No pending request matched response on %s "
+                    "(raw_correlation_type=%s, normalized_correlation=%s, pending_keys=%s)",
+                    topic,
+                    type(raw_correlation_data).__name__,
+                    correlation_data.hex() if correlation_data else None,
+                    [key.hex() for key in self._pending_requests.keys()],
+                )
 
             # For other messages, log them (command handlers are set up separately)
             logger.debug(f"Unhandled message on topic {topic}")
@@ -265,7 +308,9 @@ class CloudNodeMQTTClient:
             raise MQTTError("Not connected to MQTT broker")
 
         # Generate correlation data
-        correlation_data = uuid.uuid4().bytes
+        correlation_data = _normalize_correlation_data(uuid.uuid4().bytes)
+        if correlation_data is None:
+            raise MQTTError("Failed to generate correlation data")
 
         # Create properties with response topic and correlation data
         properties = Properties(PacketTypes.PUBLISH)

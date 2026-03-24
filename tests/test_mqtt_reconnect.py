@@ -216,3 +216,93 @@ class MQTTReconnectTests(unittest.TestCase):
 
         node._mqtt_client.connect.assert_awaited_once()
         node._subscribe_to_commands.assert_not_called()
+
+    def test_matches_response_correlation_data_when_bytearray(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch(
+            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
+        ):
+            client = CloudNodeMQTTClient(
+                host="mqtt.example.com",
+                port=1883,
+                client_id="cloud_node_test",
+                topic_prefix="local",
+            )
+
+        loop = asyncio.new_event_loop()
+        try:
+            client._loop = loop
+            correlation_data = b"\x83o\x1fL\xeb\xffG\xd4\xa7\xb7\x12\xb8\xfe\x16G&"
+            future: asyncio.Future = loop.create_future()
+            client._pending_requests[correlation_data] = future
+
+            message = SimpleNamespace(
+                topic=client._response_topic,
+                payload=b'{"success": true, "uuid": "instance-123"}',
+                properties=SimpleNamespace(CorrelationData=bytearray(correlation_data)),
+            )
+
+            client._on_message(mock_paho_client, None, message)
+            loop.run_until_complete(asyncio.sleep(0))
+
+            self.assertTrue(future.done())
+            response = future.result()
+            self.assertTrue(response.success)
+            self.assertEqual(response.payload["uuid"], "instance-123")
+            self.assertEqual(response.correlation_data, correlation_data)
+        finally:
+            loop.close()
+
+    def test_logs_unmatched_response_details(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch(
+            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
+        ):
+            client = CloudNodeMQTTClient(
+                host="mqtt.example.com",
+                port=1883,
+                client_id="cloud_node_test",
+                topic_prefix="local",
+            )
+
+        message = SimpleNamespace(
+            topic=client._response_topic,
+            payload=b'{"success": true}',
+            properties=SimpleNamespace(CorrelationData=memoryview(b"unmatched-correlation-data")),
+        )
+
+        with self.assertLogs("cyberwave_cloud_node.mqtt", level="INFO") as captured:
+            client._on_message(mock_paho_client, None, message)
+
+        joined_logs = "\n".join(captured.output)
+        self.assertIn("Received MQTT response on topic", joined_logs)
+        self.assertIn("raw_correlation_type=memoryview", joined_logs)
+        self.assertIn("No pending request matched response", joined_logs)
+
+    def test_logs_response_topic_even_without_properties(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch(
+            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
+        ):
+            client = CloudNodeMQTTClient(
+                host="mqtt.example.com",
+                port=1883,
+                client_id="cloud_node_test",
+                topic_prefix="local",
+            )
+
+        message = SimpleNamespace(
+            topic=client._response_topic,
+            payload=b'{"success": true}',
+            properties=None,
+        )
+
+        with self.assertLogs("cyberwave_cloud_node.mqtt", level="INFO") as captured:
+            client._on_message(mock_paho_client, None, message)
+
+        joined_logs = "\n".join(captured.output)
+        self.assertIn("Received MQTT response message", joined_logs)
+        self.assertIn("properties_present=False", joined_logs)
