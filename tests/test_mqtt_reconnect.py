@@ -202,6 +202,18 @@ class MQTTReconnectTests(unittest.TestCase):
         mock_paho_client.message_callback_remove.assert_called_once_with(topic)
         self.assertEqual(mock_paho_client.message_callback_add.call_count, 1)
 
+    def test_configures_paho_reconnect_backoff(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch(
+            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
+        ):
+            CloudNodeMQTTClient(host="mqtt.example.com", port=1883)
+
+        mock_paho_client.reconnect_delay_set.assert_called_once_with(
+            min_delay=2, max_delay=3600
+        )
+
     def test_mqtt_reconnect_loop_does_not_manually_reconnect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch(

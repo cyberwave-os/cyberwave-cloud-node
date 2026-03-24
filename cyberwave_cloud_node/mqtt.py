@@ -113,6 +113,7 @@ class CloudNodeMQTTClient:
             protocol=mqtt.MQTTv5,
             transport="tcp",
         )
+        self._client.reconnect_delay_set(min_delay=2, max_delay=3600)
 
         # Set authentication
         if username and password:
