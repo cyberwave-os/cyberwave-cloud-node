@@ -66,6 +66,8 @@ class ActiveWorkload:
     stderr_file: Path
     params: Dict[str, Any] = field(default_factory=dict)
     workload_uuid: Optional[str] = None  # UUID of the workload from backend
+    cancel_requested: bool = False
+    cancel_signal: Optional[str] = None
 
 
 class CloudNode:
@@ -93,6 +95,8 @@ class CloudNode:
         )
         node.run()
     """
+
+    CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES = frozenset({"simulate"})
 
     def __init__(
         self,
@@ -438,6 +442,10 @@ class CloudNode:
         """Get count of active workloads."""
         return len(self._active_workloads)
 
+    def _cancellation_counts_as_success(self, workload_type: str) -> bool:
+        """Return whether a cancelled workload type should complete successfully."""
+        return workload_type in self.CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES
+
     async def _handle_inference(self, params: dict, request_id: Optional[str]) -> None:
         """Handle an inference command by spawning a detached process."""
         try:
@@ -712,8 +720,17 @@ class CloudNode:
             Tuple of (success: bool, message: str)
         """
         try:
+            cancellation_counts_as_success = self._cancellation_counts_as_success(
+                workload.workload_type
+            )
+            if cancellation_counts_as_success:
+                workload.cancel_requested = True
+                workload.cancel_signal = signal_name
+
             # Check if process is still alive
             if not self._is_process_alive(workload.pid):
+                if cancellation_counts_as_success:
+                    await self._handle_workload_completion(workload, exit_code=None)
                 # Already dead, clean up
                 async with self._workload_lock:
                     self._active_workloads.pop(workload.pid, None)
@@ -734,6 +751,9 @@ class CloudNode:
                 f"Sending {signal_name} to workload PID {workload.pid} ({workload.workload_type})"
             )
             process.send_signal(sig)
+
+            if cancellation_counts_as_success:
+                return True, f"Workload cancellation requested with {signal_name}"
 
             # For SIGKILL, wait briefly to confirm termination
             if signal_name == "SIGKILL":
@@ -1161,6 +1181,11 @@ class CloudNode:
             exit_code: Optional exit code if already captured (to avoid race conditions)
         """
         try:
+            cancellation_counts_as_success = (
+                self._cancellation_counts_as_success(workload.workload_type)
+                and workload.cancel_requested
+            )
+
             # Get process exit code if not already provided
             if exit_code is None:
                 try:
@@ -1186,9 +1211,12 @@ class CloudNode:
             except Exception as e:
                 logger.error(f"Failed to read stderr file: {e}")
 
-            # Determine success
-            # If exit_code is None, check stdout for success indicators (e.g., "✅ Successfully")
-            if exit_code is None:
+            # Determine success.
+            # Some workload types treat manual cancellation as a completed stop,
+            # but only once the process has actually exited.
+            if cancellation_counts_as_success:
+                success = True
+            elif exit_code is None:
                 # Try to infer success from stdout content
                 if stdout_content and ("✅" in stdout_content or "Successfully" in stdout_content):
                     # If we see success indicators and no error indicators, assume success
@@ -1212,7 +1240,11 @@ class CloudNode:
             )
             # Publish results
             result_data = {
-                "message": f"{workload.workload_type} completed",
+                "message": (
+                    f"{workload.workload_type} cancelled by {workload.cancel_signal}"
+                    if cancellation_counts_as_success and workload.cancel_signal
+                    else f"{workload.workload_type} completed"
+                ),
                 "pid": workload.pid,
                 "status": "completed",
                 "success": success,
@@ -1230,7 +1262,12 @@ class CloudNode:
 
             # Step 3a: Check for files to upload and handle upload process
             # Only upload on success, and only if upload_results is enabled
-            should_upload = self.config.upload_results and workload.workload_uuid and success
+            should_upload = (
+                self.config.upload_results
+                and workload.workload_uuid
+                and success
+                and not cancellation_counts_as_success
+            )
 
             if should_upload:
                 # Check if result files exist before sending "finalizing" status

@@ -32,7 +32,7 @@ mock_httpx.TimeoutException = Exception
 mock_httpx.Response = Mock
 sys.modules.setdefault("httpx", mock_httpx)
 
-from cyberwave_cloud_node.cloud_node import CloudNode
+from cyberwave_cloud_node.cloud_node import ActiveWorkload, CloudNode
 from cyberwave_cloud_node.config import CloudNodeConfig
 from cyberwave_cloud_node.mqtt import CloudNodeMQTTClient
 
@@ -240,6 +240,157 @@ class MQTTReconnectTests(unittest.TestCase):
                 asyncio.run(node._mqtt_reconnect_loop())
 
         node._mqtt_client.connect.assert_not_awaited()
+
+    def test_cancel_simulate_workload_waits_for_process_exit_before_backend_update(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(upload_results=False),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            stdout_file = Path(tmp_dir) / "simulate.stdout.log"
+            stderr_file = Path(tmp_dir) / "simulate.stderr.log"
+            stdout_file.write_text("")
+            stderr_file.write_text("")
+            workload = ActiveWorkload(
+                pid=4321,
+                request_id="simulate-request",
+                workload_type="simulate",
+                started_at=0.0,
+                command="python run_mujoco_workload.py",
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                params={},
+                workload_uuid="workload-123",
+            )
+            node._mqtt_client = AsyncMock()
+            node._active_workloads[workload.pid] = workload
+
+            mock_process = Mock()
+            with (
+                patch.object(node, "_is_process_alive", return_value=True),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.psutil.Process",
+                    return_value=mock_process,
+                ),
+            ):
+                success, message = asyncio.run(node._cancel_workload(workload, "SIGTERM"))
+
+        self.assertTrue(success)
+        self.assertIn("cancellation requested", message.lower())
+        self.assertIn(workload.pid, node._active_workloads)
+        node._mqtt_client.update_workload_status.assert_not_awaited()
+        node._mqtt_client.complete_workload.assert_not_awaited()
+
+    def test_cancel_success_workload_types_are_generic_for_cancel_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(upload_results=False),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            stdout_file = Path(tmp_dir) / "inference.stdout.log"
+            stderr_file = Path(tmp_dir) / "inference.stderr.log"
+            stdout_file.write_text("")
+            stderr_file.write_text("")
+            workload = ActiveWorkload(
+                pid=9876,
+                request_id="inference-request",
+                workload_type="inference",
+                started_at=0.0,
+                command="python inference.py",
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                params={},
+                workload_uuid="workload-456",
+            )
+            node._mqtt_client = AsyncMock()
+            node._active_workloads[workload.pid] = workload
+
+            mock_process = Mock()
+            with (
+                patch.object(
+                    CloudNode,
+                    "CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES",
+                    {"simulate", "inference"},
+                    create=True,
+                ),
+                patch.object(node, "_is_process_alive", return_value=True),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.psutil.Process",
+                    return_value=mock_process,
+                ),
+            ):
+                success, message = asyncio.run(node._cancel_workload(workload, "SIGTERM"))
+
+        self.assertTrue(success)
+        self.assertIn("cancellation requested", message.lower())
+        self.assertTrue(workload.cancel_requested)
+        self.assertEqual(workload.cancel_signal, "SIGTERM")
+        self.assertIn(workload.pid, node._active_workloads)
+        node._mqtt_client.update_workload_status.assert_not_awaited()
+
+    def test_cancel_success_workload_types_are_generic_for_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(upload_results=False),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            stdout_file = Path(tmp_dir) / "inference.stdout.log"
+            stderr_file = Path(tmp_dir) / "inference.stderr.log"
+            stdout_file.write_text("")
+            stderr_file.write_text("")
+            workload = ActiveWorkload(
+                pid=2468,
+                request_id="inference-request",
+                workload_type="inference",
+                started_at=0.0,
+                command="python inference.py",
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                params={},
+                workload_uuid="workload-789",
+                cancel_requested=True,
+                cancel_signal="SIGTERM",
+            )
+            node._mqtt_client = AsyncMock()
+            node._buffer_log = AsyncMock()
+
+            with (
+                patch.object(
+                    CloudNode,
+                    "CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES",
+                    {"simulate", "inference"},
+                    create=True,
+                ),
+                self.assertLogs("cyberwave_cloud_node.cloud_node", level="INFO") as captured,
+            ):
+                asyncio.run(node._handle_workload_completion(workload, exit_code=1))
+
+        joined_logs = "\n".join(captured.output)
+        self.assertIn("success=True", joined_logs)
+        node._mqtt_client.complete_workload.assert_awaited_once_with(
+            workload_uuid="workload-789",
+            timeout=30.0,
+        )
 
     def test_matches_response_correlation_data_when_bytearray(self) -> None:
         mock_paho_client = Mock()
