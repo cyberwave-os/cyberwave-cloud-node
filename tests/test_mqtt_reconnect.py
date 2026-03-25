@@ -392,6 +392,49 @@ class MQTTReconnectTests(unittest.TestCase):
             timeout=30.0,
         )
 
+    def test_completion_is_deduplicated_after_cancel_handles_dead_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(upload_results=False),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            stdout_file = Path(tmp_dir) / "simulate.stdout.log"
+            stderr_file = Path(tmp_dir) / "simulate.stderr.log"
+            stdout_file.write_text("")
+            stderr_file.write_text("")
+            workload = ActiveWorkload(
+                pid=1357,
+                request_id="simulate-request",
+                workload_type="simulate",
+                started_at=0.0,
+                command="python run_mujoco_workload.py",
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                params={},
+                workload_uuid="workload-dedupe",
+            )
+            node._mqtt_client = AsyncMock()
+            node._buffer_log = AsyncMock()
+            node._active_workloads[workload.pid] = workload
+
+            with patch.object(node, "_is_process_alive", return_value=False):
+                success, _message = asyncio.run(node._cancel_workload(workload, "SIGTERM"))
+
+            self.assertTrue(success)
+
+            asyncio.run(node._handle_workload_completion(workload, exit_code=0))
+
+        node._mqtt_client.complete_workload.assert_awaited_once_with(
+            workload_uuid="workload-dedupe",
+            timeout=30.0,
+        )
+
     def test_matches_response_correlation_data_when_bytearray(self) -> None:
         mock_paho_client = Mock()
 

@@ -68,6 +68,7 @@ class ActiveWorkload:
     workload_uuid: Optional[str] = None  # UUID of the workload from backend
     cancel_requested: bool = False
     cancel_signal: Optional[str] = None
+    completion_started: bool = False
 
 
 class CloudNode:
@@ -1143,10 +1144,6 @@ class CloudNode:
 
                     await self._handle_workload_completion(workload, exit_code=exit_code)
 
-                    # Remove from active workloads
-                    async with self._workload_lock:
-                        self._active_workloads.pop(pid, None)
-
                 except Exception as e:
                     logger.error(f"Error monitoring workload PID {pid}: {e}", exc_info=True)
 
@@ -1157,6 +1154,15 @@ class CloudNode:
             return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return False
+
+    async def _claim_workload_completion(self, workload: ActiveWorkload) -> bool:
+        """Ensure completion side effects run only once per workload."""
+        async with self._workload_lock:
+            if workload.completion_started:
+                return False
+            workload.completion_started = True
+            self._active_workloads.pop(workload.pid, None)
+            return True
 
     async def _file_chunk_stream(
         self, file_path: Path, chunk_size: int = 1024 * 1024
@@ -1181,6 +1187,14 @@ class CloudNode:
             exit_code: Optional exit code if already captured (to avoid race conditions)
         """
         try:
+            if not await self._claim_workload_completion(workload):
+                logger.info(
+                    "Skipping duplicate completion for workload %s (PID %s)",
+                    workload.workload_uuid or workload.request_id or workload.workload_type,
+                    workload.pid,
+                )
+                return
+
             cancellation_counts_as_success = (
                 self._cancellation_counts_as_success(workload.workload_type)
                 and workload.cancel_requested
