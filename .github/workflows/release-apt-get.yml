@@ -2,16 +2,13 @@ name: Release to Package Registries
 
 on:
   push:
-    branches:
-      - dev
-      - staging
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Optional explicit version override"
-        required: false
+        description: "Version to release (e.g., 0.1.0)"
+        required: true
         type: string
 
 env:
@@ -49,33 +46,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set release version
+      - name: Set version from tag or input
         id: version
         run: |
-          BASE_VERSION="$(python - <<'PY'
-          import tomllib
-          with open("pyproject.toml", "rb") as f:
-              data = tomllib.load(f)
-          print(data["project"]["version"])
-          PY
-          )"
-          REF_NAME="${GITHUB_REF#refs/heads/}"
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
-          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          elif [ "${REF_NAME}" = "dev" ]; then
-            VERSION="${BASE_VERSION}~dev${GITHUB_RUN_NUMBER}"
-          elif [ "${REF_NAME}" = "staging" ]; then
-            VERSION="${BASE_VERSION}~rc${GITHUB_RUN_NUMBER}"
           else
-            echo "❌ Unable to derive release version for ref ${GITHUB_REF}"
-            exit 1
+            VERSION="${GITHUB_REF#refs/tags/v}"
           fi
-
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "📦 Base version: $BASE_VERSION"
           echo "📦 Building version: $VERSION"
 
       - name: Install dependencies
