@@ -32,7 +32,7 @@ import psutil
 
 from .client import CloudNodeClient, CloudNodeClientError
 from .config import CloudNodeConfig, get_api_token, get_instance_uuid, get_instance_slug
-from .mqtt import CloudNodeMQTTClient, MQTTError
+from .mqtt import CloudNodeAuthError, CloudNodeMQTTClient, MQTTError
 
 logger = logging.getLogger(__name__)
 
@@ -1755,6 +1755,18 @@ class CloudNode:
                     logger.debug(f"Heartbeat sent via MQTT: {response.payload.get('message')}")
                 else:
                     logger.warning("MQTT client not available for heartbeat")
+
+            except CloudNodeAuthError as e:
+                logger.error(
+                    f"Heartbeat authentication failed — API token is invalid or revoked: {e}"
+                )
+                logger.error(
+                    "The backend has rejected this cloud node's API token. "
+                    "Stop this process and restart with a valid CYBERWAVE_API_KEY "
+                    "(run start-local-cloud-node.sh after generating a fresh token)."
+                )
+                self._running = False
+                return
 
             except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(f"Heartbeat failed: {e}")
