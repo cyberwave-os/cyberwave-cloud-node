@@ -61,6 +61,23 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def get_build_version_override() -> str | None:
+    """Return the build-time version override when packaged by release CI."""
+    try:
+        from ._build_version import BUILD_VERSION
+    except ImportError:
+        return None
+    return BUILD_VERSION
+
+
+def get_cli_version() -> str:
+    """Resolve the version shown by the CLI."""
+    build_version = get_build_version_override()
+    if build_version:
+        return build_version
+    return version("cyberwave-cloud-node")
+
+
 def main() -> int:
     """Main entry point for the CLI."""
 
@@ -72,7 +89,7 @@ def main() -> int:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {version('cyberwave-cloud-node')}",
+        version=f"%(prog)s {get_cli_version()}",
     )
 
     parser.add_argument(

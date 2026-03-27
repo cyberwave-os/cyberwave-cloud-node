@@ -2,13 +2,16 @@ name: Release to Package Registries
 
 on:
   push:
+    branches:
+      - dev
+      - staging
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g., 0.1.0)"
-        required: true
+        description: "Optional explicit version override"
+        required: false
         type: string
 
 env:
@@ -46,21 +49,46 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set version from tag or input
+      - name: Set release version
         id: version
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          BASE_VERSION="$(python - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+          print(data["project"]["version"])
+          PY
+          )"
+          REF_NAME="${GITHUB_REF#refs/heads/}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
-          else
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [ "${REF_NAME}" = "dev" ]; then
+            VERSION="${BASE_VERSION}~dev${GITHUB_RUN_NUMBER}"
+          elif [ "${REF_NAME}" = "staging" ]; then
+            VERSION="${BASE_VERSION}~rc${GITHUB_RUN_NUMBER}"
+          else
+            echo "❌ Unable to derive release version for ref ${GITHUB_REF}"
+            exit 1
           fi
+
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Base version: $BASE_VERSION"
           echo "📦 Building version: $VERSION"
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -e ".[build]"
+
+      - name: Write build version override
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cat > cyberwave_cloud_node/_build_version.py <<EOF
+          BUILD_VERSION = "${VERSION}"
+          EOF
 
       - name: Build binary with PyInstaller
         run: |
@@ -79,6 +107,7 @@ jobs:
             --onefile \
             --name cyberwave-cloud-node \
             --hidden-import cyberwave_cloud_node \
+            --hidden-import cyberwave_cloud_node._build_version \
             --hidden-import cyberwave_cloud_node.cli \
             --hidden-import cyberwave_cloud_node.client \
             --hidden-import cyberwave_cloud_node.cloud_node \
