@@ -159,6 +159,39 @@ class MQTTReconnectTests(unittest.TestCase):
         self.assertEqual(params["environment_uuid"], "env-123")
         self.assertEqual(params["workload_uuid"], "workload-123")
 
+    def test_spawned_workload_process_cleans_pyinstaller_library_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(inference="python worker.py --params {body}"),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            mock_process = Mock(pid=4321)
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "LD_LIBRARY_PATH": "/tmp/_MEI12345:/usr/lib/x86_64-linux-gnu",
+                        "LD_LIBRARY_PATH_ORIG": "/usr/lib/x86_64-linux-gnu",
+                    },
+                    clear=False,
+                ),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.subprocess.Popen",
+                    return_value=mock_process,
+                ) as mock_popen,
+            ):
+                asyncio.run(node._spawn_workload_process("inference", {}, "request-123"))
+
+        spawned_env = mock_popen.call_args.kwargs["env"]
+        self.assertEqual(spawned_env.get("LD_LIBRARY_PATH"), "/usr/lib/x86_64-linux-gnu")
+        self.assertNotIn("LD_LIBRARY_PATH_ORIG", spawned_env)
+
     def test_resubscribes_command_topics_on_reconnect(self) -> None:
         mock_paho_client = Mock()
         mock_paho_client.subscribe.return_value = (mqtt.MQTT_ERR_SUCCESS, 1)

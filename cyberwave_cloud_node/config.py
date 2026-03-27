@@ -1,6 +1,7 @@
 """Configuration and constants for Cyberwave Cloud Node."""
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -119,6 +120,36 @@ def get_instance_slug() -> Optional[str]:
 
     # Fall back to stored identity
     return creds_module.get_instance_slug()
+
+
+def clean_subprocess_env() -> dict[str, str]:
+    """Return a copy of os.environ safe for child processes.
+
+    PyInstaller sets ``LD_LIBRARY_PATH`` to its extraction directory so the
+    bundled Python runtime can find its shared libraries. Child processes should
+    use the host's original library search path instead.
+    """
+    env = os.environ.copy()
+
+    orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if orig is not None:
+        if orig:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+        return env
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        ld_path = env.get("LD_LIBRARY_PATH", "")
+        if ld_path:
+            cleaned = [path for path in ld_path.split(os.pathsep) if path != meipass]
+            if cleaned:
+                env["LD_LIBRARY_PATH"] = os.pathsep.join(cleaned)
+            else:
+                env.pop("LD_LIBRARY_PATH", None)
+
+    return env
 
 
 def get_mqtt_host() -> str:

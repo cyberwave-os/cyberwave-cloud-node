@@ -31,7 +31,13 @@ import httpx
 import psutil
 
 from .client import CloudNodeClient, CloudNodeClientError
-from .config import CloudNodeConfig, get_api_token, get_instance_uuid, get_instance_slug
+from .config import (
+    CloudNodeConfig,
+    clean_subprocess_env,
+    get_api_token,
+    get_instance_slug,
+    get_instance_uuid,
+)
 from .mqtt import CloudNodeMQTTClient, MQTTError
 
 logger = logging.getLogger(__name__)
@@ -911,7 +917,7 @@ class CloudNode:
 
             # Prepare environment for subprocess
             # Inherit parent environment and explicitly pass Sentry config
-            subprocess_env = os.environ.copy()
+            subprocess_env = clean_subprocess_env()
             sentry_vars = [
                 "SENTRY_DSN",
                 "SENTRY_TRACES_SAMPLE_RATE",
@@ -1890,6 +1896,7 @@ class CloudNode:
                 shell_command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=clean_subprocess_env(),
                 cwd=self.working_dir,
             )
 
