@@ -760,12 +760,16 @@ class CloudNodeMQTTClient:
     async def complete_workload(
         self,
         workload_uuid: str,
+        success: bool = True,
+        exit_code: int | None = None,
         timeout: float = 30.0,
     ) -> MQTTResponse:
         """Mark workload as completed via MQTT.
 
         Args:
             workload_uuid: UUID of the workload to complete (must not be None or empty)
+            success: Whether the workload actually succeeded
+            exit_code: Optional process exit code for backend failure handling
             timeout: Timeout in seconds
 
         Returns:
@@ -781,7 +785,12 @@ class CloudNodeMQTTClient:
         topic = f"{self.topic_prefix}cyberwave/cloud-workload/{workload_uuid}/update-status"
 
         # Send status as dict for consistency (backend handles both formats)
-        payload = {"status": "completed"}
+        payload: dict[str, str | bool | int] = {
+            "status": "completed",
+            "success": success,
+        }
+        if exit_code is not None:
+            payload["exit_code"] = exit_code
 
         logger.info(f"Completing workload {workload_uuid} via MQTT")
 

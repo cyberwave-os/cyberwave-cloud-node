@@ -1307,6 +1307,8 @@ class CloudNode:
                 try:
                     await self._mqtt_client.complete_workload(
                         workload_uuid=str(workload.workload_uuid),
+                        success=success,
+                        exit_code=exit_code,
                         timeout=30.0,
                     )
                     logger.info(f"Workload {workload.workload_uuid} completion notified via MQTT")

@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import ANY, AsyncMock, Mock, call, patch
 
 try:
     import paho.mqtt.client as mqtt  # pyright: ignore[reportMissingImports]
@@ -389,6 +389,47 @@ class MQTTReconnectTests(unittest.TestCase):
         self.assertIn("success=True", joined_logs)
         node._mqtt_client.complete_workload.assert_awaited_once_with(
             workload_uuid="workload-789",
+            success=True,
+            exit_code=1,
+            timeout=30.0,
+        )
+
+    def test_failed_workload_completion_reports_failure_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(upload_results=False),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            stdout_file = Path(tmp_dir) / "inference.stdout.log"
+            stderr_file = Path(tmp_dir) / "inference.stderr.log"
+            stdout_file.write_text("")
+            stderr_file.write_text("ImportError: pymeshlab failed to import")
+            workload = ActiveWorkload(
+                pid=9753,
+                request_id="inference-request",
+                workload_type="inference",
+                started_at=0.0,
+                command="python inference.py",
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                params={},
+                workload_uuid="workload-failed",
+            )
+            node._mqtt_client = AsyncMock()
+            node._buffer_log = AsyncMock()
+
+            asyncio.run(node._handle_workload_completion(workload, exit_code=1))
+
+        node._mqtt_client.complete_workload.assert_awaited_once_with(
+            workload_uuid="workload-failed",
+            success=False,
+            exit_code=1,
             timeout=30.0,
         )
 
@@ -432,6 +473,33 @@ class MQTTReconnectTests(unittest.TestCase):
 
         node._mqtt_client.complete_workload.assert_awaited_once_with(
             workload_uuid="workload-dedupe",
+            success=True,
+            exit_code=ANY,
+            timeout=30.0,
+        )
+
+    def test_complete_workload_publishes_success_metadata(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch(
+            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
+        ):
+            client = CloudNodeMQTTClient(
+                host="mqtt.example.com",
+                port=1883,
+                client_id="cloud_node_test",
+                topic_prefix="local",
+            )
+
+        client.publish_request = AsyncMock(
+            return_value=SimpleNamespace(success=True, payload={})
+        )
+
+        asyncio.run(client.complete_workload("workload-123", success=False, exit_code=1))
+
+        client.publish_request.assert_awaited_once_with(
+            "localcyberwave/cloud-workload/workload-123/update-status",
+            {"status": "completed", "success": False, "exit_code": 1},
             timeout=30.0,
         )
 
