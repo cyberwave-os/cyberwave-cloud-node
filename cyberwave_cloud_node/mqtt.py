@@ -46,6 +46,16 @@ class MQTTError(Exception):
     pass
 
 
+class CloudNodeAuthError(MQTTError):
+    """Raised when the backend rejects the cloud node's API token (HTTP 401).
+
+    This is a permanent failure — the token is invalid or has been revoked
+    (e.g. after a DB reset). The cloud node must be restarted with a valid token.
+    """
+
+    pass
+
+
 @dataclass
 class MQTTResponse:
     """Response from an MQTT request/response operation."""
@@ -598,6 +608,12 @@ class CloudNodeMQTTClient:
 
         if not response.success:
             error_msg = response.payload.get("message", "Unknown error")
+            code = response.payload.get("code")
+            if code == 401:
+                raise CloudNodeAuthError(
+                    f"API token rejected by backend (401): {error_msg}. "
+                    "Restart the cloud node with a valid CYBERWAVE_API_KEY."
+                )
             raise MQTTError(f"Heartbeat failed: {error_msg}")
 
         return response

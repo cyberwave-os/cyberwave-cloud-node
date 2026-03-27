@@ -38,7 +38,7 @@ from .config import (
     get_instance_slug,
     get_instance_uuid,
 )
-from .mqtt import CloudNodeMQTTClient, MQTTError
+from .mqtt import CloudNodeAuthError, CloudNodeMQTTClient, MQTTError
 
 logger = logging.getLogger(__name__)
 
@@ -1077,14 +1077,11 @@ class CloudNode:
 
         if not workload_uuid:
             logger.warning(
-                f"Orphaned workload PID {pid} has no workload_uuid; "
-                "skipping backend notification"
+                f"Orphaned workload PID {pid} has no workload_uuid; skipping backend notification"
             )
             return
 
-        logger.info(
-            f"Handling orphaned completion for workload {workload_uuid} (PID {pid})"
-        )
+        logger.info(f"Handling orphaned completion for workload {workload_uuid} (PID {pid})")
 
         workload = ActiveWorkload(
             pid=pid,
@@ -1764,6 +1761,18 @@ class CloudNode:
                 else:
                     logger.warning("MQTT client not available for heartbeat")
 
+            except CloudNodeAuthError as e:
+                logger.error(
+                    f"Heartbeat authentication failed — API token is invalid or revoked: {e}"
+                )
+                logger.error(
+                    "The backend has rejected this cloud node's API token. "
+                    "Stop this process and restart with a valid CYBERWAVE_API_KEY "
+                    "(run start-local-cloud-node.sh after generating a fresh token)."
+                )
+                self._running = False
+                return
+
             except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(f"Heartbeat failed: {e}")
                 # Continue trying - the backend might be temporarily unavailable
@@ -1789,9 +1798,7 @@ class CloudNode:
             try:
                 # Check if MQTT is connected
                 if self._mqtt_client and not self._mqtt_client.connected:
-                    logger.warning(
-                        "MQTT connection lost; waiting for client auto-reconnect..."
-                    )
+                    logger.warning("MQTT connection lost; waiting for client auto-reconnect...")
             except Exception as e:
                 logger.error(f"Error checking MQTT connection status: {e}", exc_info=True)
                 # Don't crash - continue monitoring
