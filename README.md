@@ -350,6 +350,49 @@ Workload output is streamed to:
 
 These files are also streamed to the backend in real-time for live monitoring.
 
+## Manifest Schema (CYB-1550)
+
+Starting with `cyberwave>=0.3.46`, `cyberwave.yml` is validated against a
+Pydantic v2 schema (`cyberwave.manifest.ManifestSchema`).  Both key formats
+work:
+
+```yaml
+# New format (preferred)
+cyberwave:
+  inference: inference.py
+
+# Legacy format (still supported)
+cyberwave-cloud-node:
+  install_script: ./install.sh
+  inference: python server.py {body}
+```
+
+### Migration notes
+
+| Old convention | New convention | Notes |
+|---|---|---|
+| `cyberwave-cloud-node:` wrapper key | `cyberwave:` wrapper key | Both accepted; validator warns on legacy key |
+| `install_script:` field | `install:` field | Both accepted; `effective_install` normalises |
+| All fields in `extra: dict` silently | `extra = "forbid"` — unknown fields error | Use `--lenient` to demote to warnings during migration |
+| Shell-only dispatch | Module dispatch for `.py` values | `inference: inference.py` calls `infer()` directly |
+
+### Validating locally
+
+```bash
+cyberwave manifest validate cyberwave.yml
+cyberwave manifest validate cyberwave.yml --lenient
+```
+
+### New fields available
+
+- `workers:` — list of `.py` files using `@cw.on_frame` hooks (loaded at startup)
+- `requirements:` — pip package specs (parsed, execution deferred to CYB-1546)
+- `models:` — model IDs to pre-download (parsed, execution deferred to CYB-1546)
+- `input:` — input declaration (string normalised to list)
+- `gpu:` — hardware routing flag
+- `resources:` — memory / cpus constraints
+- `version:` — schema version (default `"1"`)
+
 ## TODO
 
 - Try it on a real repo - I cloned https://github.com/cyberwave-os/openvla-oft into this workspace
