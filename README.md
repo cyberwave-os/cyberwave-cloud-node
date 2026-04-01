@@ -25,6 +25,11 @@ pip install cyberwave-cloud-node
 sudo apt-get install cyberwave-cloud-node
 ```
 
+The same apt registry also carries `cyberwave-cloud-node-dev` and
+`cyberwave-cloud-node-staging` for explicit channel installs. Default
+`cyberwave-cloud-node` is tagged production releases; the channel packages
+conflict because they ship the same `cyberwave-cloud-node` binary.
+
 Then to the root of your repository you add a yaml file like this
 
 ```yaml

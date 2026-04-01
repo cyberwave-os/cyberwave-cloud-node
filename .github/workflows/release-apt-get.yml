@@ -130,6 +130,8 @@ jobs:
           Architecture: ${ARCH}
           Maintainer: Cyberwave <info@cyberwave.com>
           Homepage: https://cyberwave.com
+          Conflicts: cyberwave-cloud-node-dev, cyberwave-cloud-node-staging
+          Replaces: cyberwave-cloud-node-dev, cyberwave-cloud-node-staging
           Description: Cyberwave Cloud Node for inference and training
            Turn any computer into a Cyberwave Cloud Node for inference and training via MQTT.
            .

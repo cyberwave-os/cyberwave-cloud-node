@@ -20,11 +20,11 @@ class CLIVersionTests(unittest.TestCase):
         with (
             patch(
                 "cyberwave_cloud_node.cli.get_build_version_override",
-                return_value="0.2.23~dev123",
+                return_value="0.2.23.123",
             ),
             patch("cyberwave_cloud_node.cli.version", return_value="0.2.23"),
         ):
-            self.assertEqual(cli.get_cli_version(), "0.2.23~dev123")
+            self.assertEqual(cli.get_cli_version(), "0.2.23.123")
 
     def test_get_cli_version_falls_back_to_installed_metadata(self) -> None:
         with (
