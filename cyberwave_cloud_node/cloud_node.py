@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 # Platform-internal keys stripped before calling user module functions
 _PLATFORM_PARAMS = frozenset({"workload_uuid", "command_type", "status"})
 
+# Mapping from workload type to the user-facing function name in module dispatch
+_WORKLOAD_FN_MAP: dict[str, str] = {
+    "inference": "infer",
+    "training": "train",
+    "simulate": "simulate",
+}
+
 # Forward-reference type for the optional manifest schema
 try:
     from cyberwave.manifest.schema import ManifestSchema as _ManifestSchemaType
@@ -1094,7 +1101,7 @@ class CloudNode:
                 )
                 return
 
-        fn_name = "infer" if workload_type == "inference" else "train"
+        fn_name = _WORKLOAD_FN_MAP.get(workload_type, workload_type)
         fn = getattr(_sys.modules[module_key], fn_name, None)
         if fn is None:
             self._publish_response(
@@ -1166,7 +1173,7 @@ class CloudNode:
             if not abs_path.exists():
                 logger.warning("Worker file not found (skipping): %s", abs_path)
                 continue
-            count = load_workers(abs_path.parent, cw_instance=cw)
+            count = load_workers(abs_path, cw_instance=cw)
             loaded += count
             logger.info("Loaded %d hook(s) from worker: %s", count, abs_path.name)
 
