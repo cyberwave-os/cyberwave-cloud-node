@@ -42,6 +42,15 @@ from .mqtt import CloudNodeAuthError, CloudNodeMQTTClient, MQTTError
 
 logger = logging.getLogger(__name__)
 
+# Platform-internal keys stripped before calling user module functions
+_PLATFORM_PARAMS = frozenset({"workload_uuid", "command_type", "status"})
+
+# Forward-reference type for the optional manifest schema
+try:
+    from cyberwave.manifest.schema import ManifestSchema as _ManifestSchemaType
+except ImportError:  # pragma: no cover — SDK not installed
+    _ManifestSchemaType = None  # type: ignore[assignment,misc]
+
 
 class CloudNodeError(Exception):
     """Raised when a Cloud Node operation fails."""
@@ -126,6 +135,9 @@ class CloudNode:
         self.client = client or CloudNodeClient()
         self.working_dir = working_dir or Path.cwd()
 
+        # Validated manifest (loaded alongside CloudNodeConfig for new features)
+        self._manifest: Optional["_ManifestSchemaType"] = None
+
         # Instance UUID can come from environment (e.g., set by Terraform) or will be
         # assigned by the backend during registration. Check environment first.
         self.instance_uuid: str = get_instance_uuid() or ""
@@ -184,7 +196,21 @@ class CloudNode:
         """
         config = CloudNodeConfig.from_file(config_path)
         working_dir = config_path.parent if config_path else Path.cwd()
-        return cls(config=config, slug=slug, client=client, working_dir=working_dir)
+        node = cls(config=config, slug=slug, client=client, working_dir=working_dir)
+        node._load_manifest(config_path)
+        return node
+
+    def _load_manifest(self, config_path: Optional[Path] = None) -> None:
+        """Try to load a validated ManifestSchema alongside CloudNodeConfig."""
+        try:
+            from cyberwave.manifest.loader import from_file as _load_manifest_file
+
+            manifest_path = config_path or (self.working_dir / "cyberwave.yml")
+            self._manifest = _load_manifest_file(manifest_path)
+            logger.info("Manifest schema loaded from %s", manifest_path)
+        except Exception as exc:
+            logger.debug("Manifest schema not loaded (bash-only mode): %s", exc)
+            self._manifest = None
 
     @classmethod
     def from_env(
@@ -223,9 +249,28 @@ class CloudNode:
         self._setup_signal_handlers()
 
         try:
-            # Step 1: Run install script
-            if self.config.install_script:
-                await self._run_install_script()
+            # Step 1: Run install script (prefer manifest.effective_install, fall back to config)
+            install_cmd = (
+                self._manifest.effective_install if self._manifest else None
+            ) or self.config.install_script
+            if install_cmd:
+                await self._run_install_script(install_cmd)
+
+            # Log deferred manifest fields
+            if self._manifest and self._manifest.requirements:
+                logger.info(
+                    "manifest.requirements (install via 'install:' or manually): %s",
+                    self._manifest.requirements,
+                )
+            if self._manifest and self._manifest.models:
+                logger.info(
+                    "manifest.models (pre-download handled by CYB-1546 model manager): %s",
+                    self._manifest.models,
+                )
+
+            # Load manifest workers before connecting to MQTT
+            if self._manifest and self._manifest.workers:
+                await self._load_manifest_workers()
 
             # Step 2: Connect to MQTT
             await self._connect_mqtt()
@@ -805,16 +850,20 @@ class CloudNode:
         except Exception as e:
             return False, f"Failed to cancel workload: {str(e)}"
 
-    async def _run_install_script(self) -> None:
-        """Run the install script from cyberwave.yml."""
-        if not self.config.install_script:
+    async def _run_install_script(self, cmd: Optional[str] = None) -> None:
+        """Run the install script from cyberwave.yml.
+
+        Args:
+            cmd: Explicit install command.  Falls back to ``self.config.install_script``.
+        """
+        command = cmd or self.config.install_script
+        if not command:
             return
 
-        logger.info(f"Running install script: {self.config.install_script}")
+        logger.info(f"Running install script: {command}")
 
         try:
-            # Install scripts run directly with login shell to ensure conda is available
-            result = await self._run_command(self.config.install_script, workload_type="install")
+            result = await self._run_command(command, workload_type="install")
             if not result.success:
                 error_msg = f"Install script failed with code {result.return_code}"
                 if result.error:
@@ -835,7 +884,19 @@ class CloudNode:
 
         The process runs independently and is tracked by PID. Output is streamed
         to log files and will be collected when the process completes.
+
+        If the manifest declares a module dispatch path (``.py`` without spaces),
+        the workload is dispatched via :meth:`_dispatch_module_workload` instead.
         """
+        # Check for module dispatch via manifest
+        if self._manifest is not None:
+            from cyberwave.manifest.schema import detect_dispatch_mode
+
+            value = getattr(self._manifest, workload_type, None)
+            if value and detect_dispatch_mode(value) == "module":
+                await self._dispatch_module_workload(workload_type, params, request_id)
+                return
+
         # Build command
         command_map = {
             "inference": self.config.inference,
@@ -988,6 +1049,128 @@ class CloudNode:
         except Exception as e:
             logger.error(f"Failed to spawn {workload_type} process: {e}", exc_info=True)
             raise
+
+    async def _dispatch_module_workload(
+        self, workload_type: str, params: dict, request_id: Optional[str]
+    ) -> None:
+        """Import a Python module and call ``infer()``/``train()`` in a thread executor."""
+        import importlib.util
+        import sys as _sys
+
+        module_path_str = getattr(self._manifest, workload_type)
+        abs_path = self.working_dir / module_path_str
+
+        if not abs_path.exists():
+            self._publish_response(
+                request_id,
+                success=False,
+                error=(
+                    f"Module not found: {abs_path}. "
+                    f"Check '{workload_type}: {module_path_str}' in cyberwave.yml."
+                ),
+            )
+            return
+
+        module_key = f"_cyberwave_{workload_type}_module"
+        if module_key not in _sys.modules:
+            spec = importlib.util.spec_from_file_location(module_key, abs_path)
+            if spec is None or spec.loader is None:
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error=f"Cannot load module: {abs_path}",
+                )
+                return
+            module = importlib.util.module_from_spec(spec)
+            _sys.modules[module_key] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception as e:
+                del _sys.modules[module_key]
+                self._publish_response(
+                    request_id,
+                    success=False,
+                    error=f"Module import failed: {e}",
+                )
+                return
+
+        fn_name = "infer" if workload_type == "inference" else "train"
+        fn = getattr(_sys.modules[module_key], fn_name, None)
+        if fn is None:
+            self._publish_response(
+                request_id,
+                success=False,
+                error=(
+                    f"Module {module_path_str} does not export {fn_name}(). "
+                    f"Add 'def {fn_name}(**params): ...' to the module."
+                ),
+            )
+            return
+
+        workload_uuid = params.get("workload_uuid")
+
+        # Signal workload started (mirrors the bash path lifecycle)
+        if workload_uuid and self._mqtt_client:
+            try:
+                await self._mqtt_client.update_workload_status(
+                    workload_uuid=workload_uuid,
+                    status="running",
+                    additional_data={"message": f"{workload_type} module executing"},
+                )
+            except Exception as e:
+                logger.warning("Failed to send running status for module workload: %s", e)
+
+        # Strip platform-internal keys before calling user function
+        user_params = {k: v for k, v in params.items() if k not in _PLATFORM_PARAMS}
+
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(None, lambda: fn(**user_params))
+            output = json.dumps(result) if not isinstance(result, str) else result
+            self._publish_response(request_id, success=True, output=output)
+            if workload_uuid and self._mqtt_client:
+                await self._mqtt_client.complete_workload(
+                    workload_uuid=workload_uuid, success=True, exit_code=0, timeout=30.0
+                )
+        except Exception as e:
+            logger.exception("Module workload %s failed", workload_type)
+            self._publish_response(request_id, success=False, error=str(e))
+            if workload_uuid and self._mqtt_client:
+                await self._mqtt_client.complete_workload(
+                    workload_uuid=workload_uuid, success=False, exit_code=1, timeout=30.0
+                )
+
+    async def _load_manifest_workers(self) -> None:
+        """Load worker modules declared in the manifest's ``workers:`` list."""
+        if not self._manifest or not self._manifest.workers:
+            return
+        try:
+            from cyberwave import Cyberwave
+            from cyberwave.workers.loader import load_workers
+        except ImportError:
+            logger.warning(
+                "cyberwave SDK worker loader not available. "
+                "Ensure cyberwave>=0.3.46 to enable 'workers:' in cyberwave.yml."
+            )
+            return
+
+        try:
+            cw = Cyberwave()
+        except Exception as e:
+            logger.warning("Cannot initialise Cyberwave client for workers: %s. Skipping.", e)
+            return
+
+        loaded = 0
+        for worker_rel_path in self._manifest.workers:
+            abs_path = (self.working_dir / worker_rel_path).resolve()
+            if not abs_path.exists():
+                logger.warning("Worker file not found (skipping): %s", abs_path)
+                continue
+            count = load_workers(abs_path.parent, cw_instance=cw)
+            loaded += count
+            logger.info("Loaded %d hook(s) from worker: %s", count, abs_path.name)
+
+        logger.info("Manifest workers: %d module(s) loaded total", loaded)
 
     async def _save_workload_state(self):
         """Persist active workloads to local file."""
