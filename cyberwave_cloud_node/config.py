@@ -35,14 +35,14 @@ DEFAULT_HEARTBEAT_INTERVAL = 30
 
 
 def load_dotenv_files(working_dir: Optional[Path] = None) -> None:
-    """Load .env files from working directory and home directory.
+    """Load .env files from working directory and the Cyberwave config directory.
 
     Priority (highest to lowest):
     1. Environment variables (already set)
     2. .env in working directory
-    3. .env in ~/.cyberwave/
+    3. .env in the Cyberwave config directory (e.g. /etc/cyberwave or ~/.cyberwave)
     """
-    # Load from ~/.cyberwave/.env first (lowest priority)
+    # Load from config dir .env first (lowest priority)
     cyberwave_env = creds_module.CONFIG_DIR / ENV_FILE_NAME
     if cyberwave_env.exists():
         load_dotenv(cyberwave_env, override=False)
@@ -67,7 +67,7 @@ def get_api_token() -> Optional[str]:
 
     Priority:
     1. CYBERWAVE_API_KEY environment variable
-    2. Stored credentials in ~/.cyberwave/credentials.json
+    2. Stored credentials in the Cyberwave config directory (credentials.json)
     """
     token = os.getenv("CYBERWAVE_API_KEY")
     if token:
@@ -82,7 +82,7 @@ def get_workspace_slug() -> Optional[str]:
 
     Priority:
     1. CYBERWAVE_WORKSPACE_SLUG environment variable
-    2. Stored credentials in ~/.cyberwave/credentials.json
+    2. Stored credentials in the Cyberwave config directory (credentials.json)
     """
     slug = os.getenv("CYBERWAVE_WORKSPACE_SLUG")
     if slug:
@@ -97,7 +97,7 @@ def get_instance_uuid() -> Optional[str]:
 
     Priority:
     1. CYBERWAVE_CLOUD_NODE_INSTANCE_UUID environment variable
-    2. Stored identity in ~/.cyberwave/instance_identity.json
+    2. Stored identity in the Cyberwave config directory (instance_identity.json)
     """
     uuid = os.getenv("CYBERWAVE_CLOUD_NODE_INSTANCE_UUID")
     if uuid:
@@ -112,7 +112,7 @@ def get_instance_slug() -> Optional[str]:
 
     Priority:
     1. CYBERWAVE_INSTANCE_SLUG environment variable
-    2. Stored identity in ~/.cyberwave/instance_identity.json
+    2. Stored identity in the Cyberwave config directory (instance_identity.json)
     """
     slug = os.getenv("CYBERWAVE_INSTANCE_SLUG")
     if slug:

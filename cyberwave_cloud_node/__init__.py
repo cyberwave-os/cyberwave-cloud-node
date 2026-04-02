@@ -13,8 +13,13 @@ Basic Usage:
 Authentication (in order of priority):
     1. CYBERWAVE_API_KEY environment variable
     2. .env file in current directory
-    3. .env file in ~/.cyberwave/
-    4. Stored credentials from cyberwave-cli (~/.cyberwave/credentials.json)
+    3. .env file in the Cyberwave config directory
+    4. Stored credentials from cyberwave-cli (credentials.json in the config directory)
+
+Config directory (resolved at startup, same as cyberwave-cli and cyberwave-edge-core):
+    - CYBERWAVE_EDGE_CONFIG_DIR env var (explicit override)
+    - macOS: ~/.cyberwave
+    - Linux/other: /etc/cyberwave (if writable) or ~/.cyberwave
 
 Environment Variables:
     CYBERWAVE_BASE_URL: API base URL (default: https://api.cyberwave.com)

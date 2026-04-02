@@ -1,18 +1,77 @@
 """Credentials management for Cyberwave Cloud Node.
 
-Stores and retrieves credentials from ~/.cyberwave/credentials.json,
-compatible with cyberwave-cli credentials.
+Stores and retrieves credentials from the Cyberwave config directory,
+compatible with cyberwave-cli and cyberwave-edge-core credentials.
+
+Config directory resolution (same logic as cyberwave-cli and edge-core):
+  1. CYBERWAVE_EDGE_CONFIG_DIR env var (explicit override)
+  2. On macOS: ~/.cyberwave (Docker bind-mount compatibility)
+  3. On other platforms: /etc/cyberwave if writable/creatable
+  4. ~/.cyberwave as a fallback for non-root users
 """
 
 import json
 import os
+import platform
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Config directory (shared with cyberwave-cli)
-CONFIG_DIR = Path.home() / ".cyberwave"
+_SYSTEM_CONFIG_DIR = Path("/etc/cyberwave")
+_USER_CONFIG_DIR = Path.home() / ".cyberwave"
+
+
+def _resolve_sudo_user_home() -> Path | None:
+    """Return the invoking user's home directory when running via sudo."""
+    sudo_user = os.getenv("SUDO_USER", "").strip()
+    if not sudo_user:
+        return None
+    try:
+        import pwd
+
+        home = pwd.getpwnam(sudo_user).pw_dir
+    except Exception:
+        return None
+    if not home:
+        return None
+    return Path(home)
+
+
+def _resolve_config_dir() -> Path:
+    """Pick the best writable config directory.
+
+    Priority:
+      1. CYBERWAVE_EDGE_CONFIG_DIR env var (explicit override)
+      2. On macOS: ~/.cyberwave for Docker bind-mount compatibility
+      3. On other platforms: /etc/cyberwave if writable/creatable
+      4. ~/.cyberwave as a fallback for non-root users
+    """
+    env_override = os.getenv("CYBERWAVE_EDGE_CONFIG_DIR")
+    if env_override:
+        return Path(env_override)
+
+    if platform.system() == "Darwin":
+        sudo_home = _resolve_sudo_user_home()
+        base_home = sudo_home or Path.home()
+        return base_home / ".cyberwave"
+
+    if _SYSTEM_CONFIG_DIR.exists():
+        if os.access(_SYSTEM_CONFIG_DIR, os.W_OK):
+            return _SYSTEM_CONFIG_DIR
+        return _USER_CONFIG_DIR
+
+    try:
+        _SYSTEM_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return _SYSTEM_CONFIG_DIR
+    except PermissionError:
+        pass
+
+    return _USER_CONFIG_DIR
+
+
+# Config directory shared with cyberwave-cli and cyberwave-edge-core.
+CONFIG_DIR = _resolve_config_dir()
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 INSTANCE_IDENTITY_FILE = CONFIG_DIR / "instance_identity.json"
 
@@ -48,8 +107,9 @@ class Credentials:
 def ensure_config_dir() -> None:
     """Ensure the config directory exists with proper permissions."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    # Set directory permissions to user-only on Unix systems
-    if os.name != "nt":
+    # Apply user-only permissions only for home-directory configs; system
+    # directories like /etc/cyberwave use their own permission model.
+    if os.name != "nt" and CONFIG_DIR != _SYSTEM_CONFIG_DIR:
         os.chmod(CONFIG_DIR, 0o700)
 
 
