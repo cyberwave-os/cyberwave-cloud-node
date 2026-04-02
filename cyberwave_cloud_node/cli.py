@@ -161,18 +161,20 @@ def start_node(args: argparse.Namespace) -> int:
     else:
         working_dir = Path.cwd()
 
-    # Load .env files (from working dir and ~/.cyberwave/)
+    # Load .env files (from working dir and the Cyberwave config directory)
     load_dotenv_files(working_dir)
     # Initialize Sentry after dotenv loading so SENTRY_DSN from .env is honored.
     init_sentry()
 
     # Check for API token (now checks env vars, .env files, and stored credentials)
     if not get_api_token():
+        from .credentials import CONFIG_DIR  # noqa: PLC0415
+
         logger.error(
             "API token is required. You can provide it via:\n"
             "  1. CYBERWAVE_API_KEY environment variable\n"
-            "  2. .env file in current directory or ~/.cyberwave/.env\n"
-            "  3. Login with cyberwave-cli (stores in ~/.cyberwave/credentials.json)\n\n"
+            f"  2. .env file in current directory or {CONFIG_DIR}/.env\n"
+            f"  3. Login with cyberwave-cli (stores in {CONFIG_DIR}/credentials.json)\n\n"
             "Get your token from https://cyberwave.com/profile"
         )
         return 1

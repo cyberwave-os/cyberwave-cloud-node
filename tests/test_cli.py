@@ -1,5 +1,8 @@
+import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.modules.setdefault("psutil", unittest.mock.Mock())
@@ -12,7 +15,8 @@ sys.modules.setdefault("paho.mqtt.client", unittest.mock.Mock())
 sys.modules.setdefault("paho.mqtt.packettypes", unittest.mock.Mock())
 sys.modules.setdefault("paho.mqtt.properties", unittest.mock.Mock())
 
-from cyberwave_cloud_node import cli
+from cyberwave_cloud_node import cli  # noqa: E402
+from cyberwave_cloud_node.credentials import _resolve_config_dir  # noqa: E402
 
 
 class CLIVersionTests(unittest.TestCase):
@@ -32,3 +36,73 @@ class CLIVersionTests(unittest.TestCase):
             patch("cyberwave_cloud_node.cli.version", return_value="0.2.23"),
         ):
             self.assertEqual(cli.get_cli_version(), "0.2.23")
+
+
+class ConfigDirResolutionTests(unittest.TestCase):
+    def test_env_override_takes_priority(self) -> None:
+        with patch.dict(os.environ, {"CYBERWAVE_EDGE_CONFIG_DIR": "/custom/path"}):
+            result = _resolve_config_dir()
+        self.assertEqual(result, Path("/custom/path"))
+
+    def test_macos_uses_home_directory(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "cyberwave_cloud_node.credentials.platform.system",
+                return_value="Darwin",
+            ),
+            patch(
+                "cyberwave_cloud_node.credentials._resolve_sudo_user_home",
+                return_value=None,
+            ),
+            patch(
+                "cyberwave_cloud_node.credentials.Path.home",
+                return_value=Path("/Users/testuser"),
+            ),
+        ):
+            result = _resolve_config_dir()
+        self.assertEqual(result, Path("/Users/testuser/.cyberwave"))
+
+    def test_linux_uses_system_dir_when_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            system_dir = Path(tmp_dir) / "etc" / "cyberwave"
+            system_dir.mkdir(parents=True)
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "cyberwave_cloud_node.credentials.platform.system",
+                    return_value="Linux",
+                ),
+                patch(
+                    "cyberwave_cloud_node.credentials._SYSTEM_CONFIG_DIR",
+                    system_dir,
+                ),
+                patch("cyberwave_cloud_node.credentials.os.access", return_value=True),
+            ):
+                result = _resolve_config_dir()
+            self.assertEqual(result, system_dir)
+
+    def test_linux_falls_back_to_home_when_system_dir_not_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            system_dir = Path(tmp_dir) / "etc" / "cyberwave"
+            system_dir.mkdir(parents=True)
+            home_dir = Path(tmp_dir) / "home" / "testuser"
+            home_dir.mkdir(parents=True)
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "cyberwave_cloud_node.credentials.platform.system",
+                    return_value="Linux",
+                ),
+                patch(
+                    "cyberwave_cloud_node.credentials._SYSTEM_CONFIG_DIR",
+                    system_dir,
+                ),
+                patch(
+                    "cyberwave_cloud_node.credentials._USER_CONFIG_DIR",
+                    home_dir / ".cyberwave",
+                ),
+                patch("cyberwave_cloud_node.credentials.os.access", return_value=False),
+            ):
+                result = _resolve_config_dir()
+            self.assertEqual(result, home_dir / ".cyberwave")
