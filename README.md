@@ -42,7 +42,7 @@ cyberwave-cloud-node:
   profile_slug: gpu-a100                # optional: node profile (default: "default")
   heartbeat_interval: 30                # optional: heartbeat interval in seconds
   mqtt_host: mqtt.cyberwave.com         # optional: custom MQTT broker
-  mqtt_port: 1883                       # optional: custom MQTT port
+  mqtt_port: 8883                       # optional: custom MQTT port (default: 8883 with TLS)
 ```
 
 Behind the scenes, Cyberwave Cloud Node will take care of:
@@ -90,7 +90,7 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 ### Optional - MQTT
 
 - `CYBERWAVE_MQTT_HOST`: MQTT broker host (default: mqtt.cyberwave.com)
-- `CYBERWAVE_MQTT_PORT`: MQTT broker port (default: 1883)
+- `CYBERWAVE_MQTT_PORT`: MQTT broker port (default: 8883)
 - `CYBERWAVE_MQTT_USERNAME`: MQTT username if required
 - `CYBERWAVE_MQTT_PASSWORD`: MQTT password if required
 - `CYBERWAVE_ENVIRONMENT`: Environment prefix for MQTT topics (empty for production)
@@ -121,7 +121,7 @@ cyberwave-cloud-node start --config ./path/to/cyberwave.yml
 # With profile override
 cyberwave-cloud-node start --profile gpu-a100
 
-# With custom MQTT broker
+# With custom MQTT broker (local dev, no TLS)
 cyberwave-cloud-node start --mqtt-host localhost --mqtt-port 1883
 
 # Verbose logging
@@ -155,7 +155,7 @@ config = CloudNodeConfig(
     profile_slug="gpu-a100",
     heartbeat_interval=30,
     mqtt_host="mqtt.cyberwave.com",
-    mqtt_port=1883,
+    mqtt_port=8883,
 )
 node = CloudNode(config=config, slug="my-gpu-node")
 node.run()
