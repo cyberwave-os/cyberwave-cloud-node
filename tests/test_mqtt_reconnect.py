@@ -192,6 +192,51 @@ class MQTTReconnectTests(unittest.TestCase):
         self.assertEqual(spawned_env.get("LD_LIBRARY_PATH"), "/usr/lib/x86_64-linux-gnu")
         self.assertNotIn("LD_LIBRARY_PATH_ORIG", spawned_env)
 
+    def test_spawn_workload_process_keeps_running_when_status_update_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(simulate="python worker.py --params {body}"),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            node._mqtt_client = AsyncMock()
+            node._mqtt_client.update_workload_status.side_effect = Exception("mqtt timeout")
+
+            mock_process = Mock(pid=9876)
+            with (
+                patch.object(node, "_save_workload_state", new=AsyncMock()),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.subprocess.Popen",
+                    return_value=mock_process,
+                ),
+                self.assertLogs("cyberwave_cloud_node.cloud_node", level="WARNING") as captured,
+            ):
+                asyncio.run(
+                    node._spawn_workload_process(
+                        "simulate",
+                        {"workload_uuid": "workload-123"},
+                        "request-123",
+                    )
+                )
+
+        self.assertIn(9876, node._active_workloads)
+        self.assertEqual(node._active_workloads[9876].workload_uuid, "workload-123")
+        node._mqtt_client.update_workload_status.assert_awaited_once_with(
+            workload_uuid="workload-123",
+            status="running",
+            additional_data={
+                "message": "simulate started in background",
+                "pid": 9876,
+            },
+        )
+        joined_logs = "\n".join(captured.output)
+        self.assertIn("Failed to update workload workload-123 status to 'running'", joined_logs)
+
     def test_resubscribes_command_topics_on_reconnect(self) -> None:
         mock_paho_client = Mock()
         mock_paho_client.subscribe.return_value = (mqtt.MQTT_ERR_SUCCESS, 1)
