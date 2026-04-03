@@ -24,7 +24,7 @@ CLOUD_NODE_WORKLOAD_COMPLETE_ENDPOINT = "/api/v1/cloud-node/workload/{uuid}/comp
 CLOUD_NODE_WORKLOAD_FAIL_ENDPOINT = "/api/v1/cloud-node/workload/{uuid}/fail"
 # MQTT Configuration
 DEFAULT_MQTT_HOST = "mqtt.cyberwave.com"
-DEFAULT_MQTT_PORT = 1883
+DEFAULT_MQTT_PORT = 8883
 
 # Default config file name
 CONFIG_FILE_NAME = "cyberwave.yml"
@@ -223,7 +223,7 @@ class CloudNodeConfig:
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
     mqtt_host: str = DEFAULT_MQTT_HOST
     mqtt_port: int = DEFAULT_MQTT_PORT
-    mqtt_use_tls: bool = False
+    mqtt_use_tls: bool = True
     mqtt_tls_ca_certs: Optional[str] = None
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
