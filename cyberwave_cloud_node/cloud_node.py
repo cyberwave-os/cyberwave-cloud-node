@@ -1043,14 +1043,22 @@ class CloudNode:
             if not workload_uuid:
                 logger.warning("Workload UUID not available, skipping workload status update")
                 return
-            await self._mqtt_client.update_workload_status(
-                workload_uuid=workload_uuid,
-                status="running",
-                additional_data={
-                    "message": f"{workload_type} started in background",
-                    "pid": pid,
-                },
-            )
+            try:
+                await self._mqtt_client.update_workload_status(
+                    workload_uuid=workload_uuid,
+                    status="running",
+                    additional_data={
+                        "message": f"{workload_type} started in background",
+                        "pid": pid,
+                    },
+                )
+            except Exception as status_err:
+                # The process is already running — don't propagate this as a spawn failure.
+                # The backend reconciliation will re-dispatch and eventually sync status.
+                logger.warning(
+                    f"Failed to update workload {workload_uuid} status to 'running' "
+                    f"(process PID {pid} is running): {status_err}"
+                )
             return
 
         except Exception as e:
