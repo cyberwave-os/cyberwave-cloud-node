@@ -13,7 +13,7 @@ Config directory resolution (same logic as cyberwave-cli and edge-core):
 import json
 import os
 import platform
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -86,14 +86,54 @@ class Credentials:
     workspace_uuid: Optional[str] = None
     workspace_name: Optional[str] = None
     workspace_slug: Optional[str] = None
+    cyberwave_environment: Optional[str] = None
+    cyberwave_base_url: Optional[str] = None
+    cyberwave_mqtt_host: Optional[str] = None
+    cyberwave_mqtt_port: Optional[str] = None
+
+    def runtime_envs(self) -> dict[str, str]:
+        """Return persisted runtime env vars shared with cloud node launches."""
+        envs: dict[str, str] = {}
+        if self.cyberwave_environment:
+            envs["CYBERWAVE_ENVIRONMENT"] = self.cyberwave_environment
+        if self.cyberwave_base_url:
+            envs["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
+        if self.cyberwave_mqtt_host:
+            envs["CYBERWAVE_MQTT_HOST"] = self.cyberwave_mqtt_host
+        if self.cyberwave_mqtt_port:
+            envs["CYBERWAVE_MQTT_PORT"] = self.cyberwave_mqtt_port
+        return envs
 
     def to_dict(self) -> dict:
         """Convert credentials to dictionary."""
-        return asdict(self)
+        payload = {
+            "token": self.token,
+            "email": self.email,
+            "created_at": self.created_at,
+            "workspace_uuid": self.workspace_uuid,
+            "workspace_name": self.workspace_name,
+            "workspace_slug": self.workspace_slug,
+        }
+        envs = self.runtime_envs()
+        if envs:
+            payload["envs"] = envs
+        return {key: value for key, value in payload.items() if value is not None}
 
     @classmethod
     def from_dict(cls, data: dict) -> "Credentials":
         """Create credentials from dictionary."""
+        raw_envs = data.get("envs")
+        envs: dict[str, object] = raw_envs if isinstance(raw_envs, dict) else {}
+
+        def _env_value(key: str) -> Optional[str]:
+            value = envs.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            flat_value = data.get(key)
+            if isinstance(flat_value, str) and flat_value.strip():
+                return flat_value.strip()
+            return None
+
         return cls(
             token=data.get("token", ""),
             email=data.get("email"),
@@ -101,6 +141,10 @@ class Credentials:
             workspace_uuid=data.get("workspace_uuid"),
             workspace_name=data.get("workspace_name"),
             workspace_slug=data.get("workspace_slug"),
+            cyberwave_environment=_env_value("CYBERWAVE_ENVIRONMENT"),
+            cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
+            cyberwave_mqtt_host=_env_value("CYBERWAVE_MQTT_HOST"),
+            cyberwave_mqtt_port=_env_value("CYBERWAVE_MQTT_PORT"),
         )
 
 

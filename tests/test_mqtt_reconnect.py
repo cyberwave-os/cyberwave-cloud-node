@@ -128,6 +128,59 @@ class MQTTReconnectTests(unittest.TestCase):
         )
         mock_mqtt_client.connect.assert_awaited_once()
 
+    def test_cloud_node_uses_stored_environment_for_topic_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "cyberwave_cloud_node.config.creds_module.load_credentials",
+                    return_value=SimpleNamespace(cyberwave_environment="local"),
+                ),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.Path.home",
+                    return_value=Path(tmp_dir),
+                ),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+        self.assertEqual(node._topic_prefix, "local")
+
+    def test_connect_mqtt_logs_full_username_and_password(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(
+                        mqtt_username="explicit-user",
+                        mqtt_password="explicit-password",
+                    ),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            mock_mqtt_client = AsyncMock()
+            with (
+                patch(
+                    "cyberwave_cloud_node.cloud_node.get_api_token",
+                    return_value="api-token",
+                ),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.CloudNodeMQTTClient",
+                    return_value=mock_mqtt_client,
+                ),
+                patch("cyberwave_cloud_node.cloud_node.logger") as mock_logger,
+            ):
+                asyncio.run(node._connect_mqtt())
+
+        mock_logger.info.assert_any_call("MQTT username: explicit-user")
+        mock_logger.info.assert_any_call("MQTT password: explicit-password")
+
     def test_workload_received_dispatches_simulate_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch(

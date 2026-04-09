@@ -124,10 +124,10 @@ class CloudNodeMQTTClient:
             transport="tcp",
         )
         self._client.reconnect_delay_set(min_delay=2, max_delay=3600)
-
+        effective_password = password or api_token
         # Set authentication
-        if username and password:
-            self._client.username_pw_set(username, password)
+        if username and effective_password:
+            self._client.username_pw_set(username, effective_password)
 
         if self.use_tls:
             self._client.tls_set(

@@ -35,6 +35,7 @@ from .config import (
     CloudNodeConfig,
     clean_subprocess_env,
     get_api_token,
+    get_environment,
     get_instance_slug,
     get_instance_uuid,
 )
@@ -175,8 +176,8 @@ class CloudNode:
         self._mqtt_client: Optional[CloudNodeMQTTClient] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Determine topic prefix from CYBERWAVE_ENVIRONMENT variable
-        env_value = os.getenv("CYBERWAVE_ENVIRONMENT", "").strip()
+        # Determine topic prefix from the shared runtime environment configuration.
+        env_value = (get_environment() or "").strip()
         topic_prefix = ""
         if not env_value or env_value.lower() == "production":
             topic_prefix = ""

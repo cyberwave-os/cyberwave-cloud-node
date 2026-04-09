@@ -58,8 +58,16 @@ def load_dotenv_files(working_dir: Optional[Path] = None) -> None:
 
 
 def get_api_url() -> str:
-    """Get the backend base URL from environment or default."""
-    return os.getenv("CYBERWAVE_BASE_URL", DEFAULT_BASE_URL)
+    """Get the backend base URL from environment, stored credentials, or default."""
+    value = os.getenv("CYBERWAVE_BASE_URL")
+    if value:
+        return value
+
+    creds = creds_module.load_credentials()
+    if creds and creds.cyberwave_base_url:
+        return creds.cyberwave_base_url
+
+    return DEFAULT_BASE_URL
 
 
 def get_api_token() -> Optional[str]:
@@ -90,6 +98,19 @@ def get_workspace_slug() -> Optional[str]:
 
     # Fall back to stored credentials
     return creds_module.get_workspace_slug()
+
+
+def get_environment() -> Optional[str]:
+    """Get the Cyberwave environment from environment or stored credentials."""
+    value = os.getenv("CYBERWAVE_ENVIRONMENT")
+    if value:
+        return value
+
+    creds = creds_module.load_credentials()
+    if creds and creds.cyberwave_environment:
+        return creds.cyberwave_environment
+
+    return None
 
 
 def get_instance_uuid() -> Optional[str]:
@@ -153,13 +174,29 @@ def clean_subprocess_env() -> dict[str, str]:
 
 
 def get_mqtt_host() -> str:
-    """Get MQTT broker host from environment or default."""
-    return os.getenv("CYBERWAVE_MQTT_HOST", DEFAULT_MQTT_HOST)
+    """Get MQTT broker host from environment, stored credentials, or default."""
+    value = os.getenv("CYBERWAVE_MQTT_HOST")
+    if value:
+        return value
+
+    creds = creds_module.load_credentials()
+    if creds and creds.cyberwave_mqtt_host:
+        return creds.cyberwave_mqtt_host
+
+    return DEFAULT_MQTT_HOST
 
 
 def get_mqtt_port() -> int:
-    """Get MQTT broker port from environment or default."""
-    return int(os.getenv("CYBERWAVE_MQTT_PORT", str(DEFAULT_MQTT_PORT)))
+    """Get MQTT broker port from environment, stored credentials, or default."""
+    value = os.getenv("CYBERWAVE_MQTT_PORT")
+    if value:
+        return int(value)
+
+    creds = creds_module.load_credentials()
+    if creds and creds.cyberwave_mqtt_port:
+        return int(creds.cyberwave_mqtt_port)
+
+    return DEFAULT_MQTT_PORT
 
 
 def _parse_bool(value: str, default: bool) -> bool:

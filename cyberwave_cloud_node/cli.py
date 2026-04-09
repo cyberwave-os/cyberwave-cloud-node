@@ -14,7 +14,13 @@ from importlib.metadata import version
 from pathlib import Path
 
 from .cloud_node import CloudNode, CloudNodeError
-from .config import CloudNodeConfig, get_api_token, get_instance_slug, load_dotenv_files
+from .config import (
+    CloudNodeConfig,
+    get_api_token,
+    get_instance_slug,
+    get_instance_uuid,
+    load_dotenv_files,
+)
 
 
 def init_sentry() -> None:
@@ -204,6 +210,7 @@ def start_node(args: argparse.Namespace) -> int:
         if slug:
             logger.info(f"Starting Cloud Node with slug hint '{slug}'")
         logger.info(f"Profile: {config.profile_slug}")
+        logger.info(f"Instance UUID: {get_instance_uuid()}")
         logger.info(f"MQTT Broker: {config.mqtt_host}:{config.mqtt_port}")
         if config.inference:
             logger.info(f"Inference command: {config.inference}")
