@@ -810,7 +810,16 @@ class CloudNode:
             logger.info(
                 f"Sending {signal_name} to workload PID {workload.pid} ({workload.workload_type})"
             )
-            process.send_signal(sig)
+            if hasattr(os, "killpg"):
+                try:
+                    # Workloads are spawned with start_new_session=True, so the tracked
+                    # PID is also the process-group leader for the shell wrapper and its
+                    # child command. Signal the whole group so the actual workload exits.
+                    os.killpg(workload.pid, sig)
+                except ProcessLookupError:
+                    process.send_signal(sig)
+            else:
+                process.send_signal(sig)
 
             if cancellation_counts_as_success:
                 return True, f"Workload cancellation requested with {signal_name}"

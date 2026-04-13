@@ -388,6 +388,52 @@ class MQTTReconnectTests(unittest.TestCase):
         node._mqtt_client.update_workload_status.assert_not_awaited()
         node._mqtt_client.complete_workload.assert_not_awaited()
 
+    def test_cancel_simulate_workload_signals_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(upload_results=False),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            stdout_file = Path(tmp_dir) / "simulate-group.stdout.log"
+            stderr_file = Path(tmp_dir) / "simulate-group.stderr.log"
+            stdout_file.write_text("")
+            stderr_file.write_text("")
+            workload = ActiveWorkload(
+                pid=5432,
+                request_id="simulate-group-request",
+                workload_type="simulate",
+                started_at=0.0,
+                command="python run_mujoco_workload.py",
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                params={},
+                workload_uuid="workload-group-123",
+            )
+            node._mqtt_client = AsyncMock()
+            node._active_workloads[workload.pid] = workload
+
+            mock_process = Mock()
+            with (
+                patch.object(node, "_is_process_alive", return_value=True),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.psutil.Process",
+                    return_value=mock_process,
+                ),
+                patch("cyberwave_cloud_node.cloud_node.os.killpg") as killpg_mock,
+            ):
+                success, message = asyncio.run(node._cancel_workload(workload, "SIGTERM"))
+
+        self.assertTrue(success)
+        self.assertIn("cancellation requested", message.lower())
+        killpg_mock.assert_called_once()
+        mock_process.send_signal.assert_not_called()
+
     def test_cancel_success_workload_types_are_generic_for_cancel_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch(
