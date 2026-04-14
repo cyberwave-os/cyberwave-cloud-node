@@ -84,6 +84,29 @@ def get_cli_version() -> str:
     return version("cyberwave-cloud-node")
 
 
+def _load_sdk_default_api():
+    """Import and return the generated SDK DefaultApi type."""
+    from cyberwave.rest import DefaultApi
+
+    return DefaultApi
+
+
+def run_sdk_selfcheck() -> int:
+    """Verify the packaged runtime contains the generated REST SDK."""
+    try:
+        default_api = _load_sdk_default_api()
+    except Exception as exc:
+        print(f"sdk-rest-missing: {exc}", file=sys.stderr)
+        return 1
+
+    if default_api is None:
+        print("sdk-rest-missing: DefaultApi unavailable", file=sys.stderr)
+        return 1
+
+    print("sdk-rest-ok")
+    return 0
+
+
 def main() -> int:
     """Main entry point for the CLI."""
 
@@ -106,6 +129,7 @@ def main() -> int:
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers.add_parser("__selfcheck_sdk", help=argparse.SUPPRESS)
 
     # Start command
     start_parser = subparsers.add_parser(
@@ -149,6 +173,9 @@ def main() -> int:
     if args.command is None:
         parser.print_help()
         return 1
+
+    if args.command == "__selfcheck_sdk":
+        return run_sdk_selfcheck()
 
     if args.command == "start":
         return start_node(args)

@@ -40,6 +40,25 @@ class CLIVersionTests(unittest.TestCase):
         ):
             self.assertEqual(cli.get_cli_version(), "0.2.23")
 
+    def test_selfcheck_sdk_command_succeeds(self) -> None:
+        with (
+            patch("cyberwave_cloud_node.cli._load_sdk_default_api", return_value=object()),
+            patch("cyberwave_cloud_node.cli.get_cli_version", return_value="0.2.23"),
+            patch.object(sys, "argv", ["cyberwave-cloud-node", "__selfcheck_sdk"]),
+        ):
+            self.assertEqual(cli.main(), 0)
+
+    def test_selfcheck_sdk_command_fails_when_rest_client_missing(self) -> None:
+        with (
+            patch(
+                "cyberwave_cloud_node.cli._load_sdk_default_api",
+                side_effect=ImportError("missing rest client"),
+            ),
+            patch("cyberwave_cloud_node.cli.get_cli_version", return_value="0.2.23"),
+            patch.object(sys, "argv", ["cyberwave-cloud-node", "__selfcheck_sdk"]),
+        ):
+            self.assertEqual(cli.main(), 1)
+
 
 class ConfigDirResolutionTests(unittest.TestCase):
     def test_env_override_takes_priority(self) -> None:
