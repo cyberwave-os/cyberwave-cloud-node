@@ -30,6 +30,8 @@ The same apt registry also carries `cyberwave-cloud-node-dev` and
 `cyberwave-cloud-node` is tagged production releases; the channel packages
 conflict because they ship the same `cyberwave-cloud-node` binary.
 
+On non-apt platforms, prerelease Python wheels are published to the Buildkite Python registry and consumed automatically by `cyberwave compute install --channel dev|staging`. Stable pip installs continue to use the public PyPI release.
+
 Then to the root of your repository you add a yaml file like this
 
 ```yaml
