@@ -1008,6 +1008,11 @@ class CloudNode:
                     subprocess_env[var] = os.environ[var]
                     logger.debug(f"Passing {var} to subprocess")
 
+            api_token = get_api_token()
+            if api_token:
+                subprocess_env["CYBERWAVE_API_KEY"] = api_token
+                logger.debug("Passing CYBERWAVE_API_KEY to subprocess")
+
             with stdout_file.open("w") as stdout_f, stderr_file.open("w") as stderr_f:
                 process = subprocess.Popen(
                     shell_command,

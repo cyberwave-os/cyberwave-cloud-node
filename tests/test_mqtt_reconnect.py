@@ -213,6 +213,35 @@ class MQTTReconnectTests(unittest.TestCase):
         self.assertEqual(spawned_env.get("LD_LIBRARY_PATH"), "/usr/lib/x86_64-linux-gnu")
         self.assertNotIn("LD_LIBRARY_PATH_ORIG", spawned_env)
 
+    def test_spawned_workload_process_passes_resolved_api_key_to_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(inference="python worker.py --params {body}"),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            mock_process = Mock(pid=4321)
+            with (
+                patch.object(node, "_save_workload_state", new=AsyncMock()),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.get_api_token",
+                    return_value="resolved-token-123",
+                ),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.subprocess.Popen",
+                    return_value=mock_process,
+                ) as mock_popen,
+            ):
+                asyncio.run(node._spawn_workload_process("inference", {}, "request-123"))
+
+        spawned_env = mock_popen.call_args.kwargs["env"]
+        self.assertEqual(spawned_env.get("CYBERWAVE_API_KEY"), "resolved-token-123")
+
     def test_spawn_workload_process_keeps_running_when_status_update_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch(
