@@ -7,7 +7,7 @@ cyberwave-cloud-node:
   heartbeat_interval: 30
   upload_results: false
   results_folder: /tmp/cyberwave-test/results
-  
+
   # Mock inference command (simulates Hunyuan3D-2 mesh generation)
   # Uses mock_inference.py which copies a test.glb to results
   inference: |
