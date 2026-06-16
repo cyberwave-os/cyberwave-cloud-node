@@ -94,7 +94,7 @@ If you've already logged in with `cyberwave-cli`, the Cloud Node will automatica
 - `CYBERWAVE_MQTT_HOST`: MQTT broker host (default: mqtt.cyberwave.com)
 - `CYBERWAVE_MQTT_PORT`: MQTT broker port (default: 8883)
 - `CYBERWAVE_MQTT_USERNAME`: MQTT username if required
-- `CYBERWAVE_MQTT_PASSWORD`: MQTT password if required
+- `CYBERWAVE_MQTT_PASSWORD`: MQTT password if required; falls back to `CYBERWAVE_API_KEY`
 - `CYBERWAVE_ENVIRONMENT`: Environment prefix for MQTT topics (empty for production)
 
 ### Optional - Commands (alternative to cyberwave.yml)

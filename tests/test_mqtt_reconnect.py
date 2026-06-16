@@ -1,10 +1,18 @@
+"""Cloud-node MQTT tests.
+
+The package imports below intentionally happen after lightweight dependency
+stubs are installed into ``sys.modules``.
+"""
+
+# ruff: noqa: E402
+
 import asyncio
 import os
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 from unittest.mock import ANY, AsyncMock, Mock, call, patch
 
 try:
@@ -63,6 +71,30 @@ class MQTTReconnectTests(unittest.TestCase):
                 os.environ["CYBERWAVE_MQTT_USERNAME"] = original
 
         self.assertEqual(config.mqtt_username, "explicit-mqtt-username")
+
+    def test_config_reads_mqtt_password_from_environment_before_api_key(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CYBERWAVE_MQTT_PASSWORD": "explicit-mqtt-password",
+                "CYBERWAVE_API_KEY": "api-token",
+            },
+        ):
+            config = CloudNodeConfig.from_dict({"cyberwave-cloud-node": {}})
+
+        self.assertEqual(config.mqtt_password, "explicit-mqtt-password")
+
+    def test_config_falls_back_to_api_key_for_mqtt_password(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CYBERWAVE_API_KEY": "api-token",
+            },
+            clear=True,
+        ):
+            config = CloudNodeConfig.from_dict({"cyberwave-cloud-node": {}})
+
+        self.assertEqual(config.mqtt_password, "api-token")
 
     def test_connect_mqtt_uses_generated_bootstrap_username_when_identity_missing(
         self,

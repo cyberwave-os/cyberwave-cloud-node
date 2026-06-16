@@ -241,7 +241,15 @@ def get_mqtt_username() -> Optional[str]:
 
 
 def get_mqtt_password() -> Optional[str]:
-    """Get MQTT password from environment."""
+    """Get MQTT password from environment.
+
+    Priority:
+    1. CYBERWAVE_MQTT_PASSWORD environment variable
+    2. CYBERWAVE_API_KEY for brokers that authenticate with the API token
+    """
+    password = os.getenv("CYBERWAVE_MQTT_PASSWORD")
+    if password:
+        return password
     return os.getenv("CYBERWAVE_API_KEY")
 
 
