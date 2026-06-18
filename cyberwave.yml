@@ -1,10 +1,12 @@
 # Cyberwave Cloud Node configuration for local testing
 # Uses mock scripts for realistic workload testing without GPU
 cyberwave-cloud-node:
-  profile_slug: openvla-oft
+  profile_slug: cyberwave-code-controller
   provider: self-hosted
   server_port: 8080
   heartbeat_interval: 30
+  mqtt_username: test
+  mqtt_password: test
   upload_results: false
   results_folder: /tmp/cyberwave-test/results
 
@@ -14,7 +16,7 @@ cyberwave-cloud-node:
     echo "Starting mock inference..." && \
     export RESULTS_DIR=/tmp/cyberwave-test/results && \
     export INPUT_DIR=/tmp/cyberwave-test/inputs && \
-    python3 /Users/cicciodepa/git/cyberwave/cyberwave-cloud-nodes/tests/hunyuan3d/mock_inference.py {body} 2>&1 || \
+    python3 /home/tomas/cyberwave_clone/cyberwave-cloud-nodes/tests/hunyuan3d/mock_inference.py {body} 2>&1 || \
     (echo "Mock inference fallback: simple test" && sleep 3 && echo '{"status": "completed"}' > /tmp/cyberwave-test/results/inference_result.json && echo "Inference complete")
 
   # Mock training command (simulates OpenVLA-OFT fine-tuning)
@@ -23,5 +25,5 @@ cyberwave-cloud-node:
     echo "Starting mock training..." && \
     export RESULTS_DIR=/tmp/cyberwave-test/results && \
     export RUNS_DIR=/tmp/cyberwave-test/runs && \
-    python3 /Users/cicciodepa/git/cyberwave/cyberwave-cloud-nodes/tests/openvla-oft/mock_training.py {body} 2>&1 || \
+    python3 /home/tomas/cyberwave_clone/cyberwave-cloud-nodes/tests/openvla-oft/mock_training.py {body} 2>&1 || \
     (echo "Mock training fallback: simple test" && sleep 5 && echo '{"status": "completed", "steps": 5}' > /tmp/cyberwave-test/results/training_result.json && echo "Training complete")
