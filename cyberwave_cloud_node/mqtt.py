@@ -56,6 +56,20 @@ class CloudNodeAuthError(MQTTError):
     pass
 
 
+class CloudNodeInstanceGoneError(MQTTError):
+    """Raised when the backend reports this node's instance no longer exists.
+
+    Triggered by a heartbeat response of code 404 (instance row deleted) or
+    code 400 "instance is terminating/terminated". This happens when the
+    instance was reaped as stale while the node was disconnected from the
+    broker. Recovery is to re-register a *fresh* instance — NOT to keep
+    retrying heartbeats against the dead UUID, which would orphan the node
+    forever.
+    """
+
+    pass
+
+
 @dataclass
 class MQTTResponse:
     """Response from an MQTT request/response operation."""
@@ -459,6 +473,21 @@ class CloudNodeMQTTClient:
 
         logger.info(f"Subscribed to command topic: {topic}")
 
+    def unsubscribe_command(self, topic: str) -> None:
+        """Stop handling a command topic.
+
+        Used when re-registering under a fresh instance UUID so the old
+        instance's command topic is not silently re-subscribed on the next
+        reconnect (``_resubscribe_command_topics`` only iterates remembered
+        topics).
+        """
+        self._command_callbacks.pop(topic, None)
+        with contextlib.suppress(Exception):
+            self._client.message_callback_remove(topic)
+        with contextlib.suppress(Exception):
+            self._client.unsubscribe(topic)
+        logger.info(f"Unsubscribed from command topic: {topic}")
+
     def _resubscribe_command_topics(self) -> None:
         """Re-subscribe all remembered command topics after reconnect."""
         for topic, callback in self._command_callbacks.items():
@@ -613,6 +642,15 @@ class CloudNodeMQTTClient:
                 raise CloudNodeAuthError(
                     f"API token rejected by backend (401): {error_msg}. "
                     "Restart the cloud node with a valid CYBERWAVE_API_KEY."
+                )
+            # The instance was reaped/terminated on the backend (typically while
+            # we were disconnected from the broker). 404 = row deleted; 400 with
+            # a "terminating/terminated" message = record_heartbeat refusing a
+            # dead instance. Either way the only recovery is re-registration.
+            if code == 404 or (code == 400 and "terminat" in str(error_msg).lower()):
+                raise CloudNodeInstanceGoneError(
+                    f"Backend reports instance {instance_uuid} is gone "
+                    f"(code={code}): {error_msg}. Re-registration required."
                 )
             raise MQTTError(f"Heartbeat failed: {error_msg}")
 
@@ -779,6 +817,8 @@ class CloudNodeMQTTClient:
         success: bool = True,
         exit_code: int | None = None,
         timeout: float = 30.0,
+        error: str | None = None,
+        stderr: str | None = None,
     ) -> MQTTResponse:
         """Mark workload as completed via MQTT.
 
@@ -787,6 +827,8 @@ class CloudNodeMQTTClient:
             success: Whether the workload actually succeeded
             exit_code: Optional process exit code for backend failure handling
             timeout: Timeout in seconds
+            error: Optional short, human-readable failure summary
+            stderr: Optional bounded stderr tail for diagnostics
 
         Returns:
             MQTTResponse with completion confirmation
@@ -807,6 +849,10 @@ class CloudNodeMQTTClient:
         }
         if exit_code is not None:
             payload["exit_code"] = exit_code
+        if error:
+            payload["error"] = error
+        if stderr:
+            payload["stderr"] = stderr
 
         logger.info(f"Completing workload {workload_uuid} via MQTT")
 
@@ -848,9 +894,7 @@ class CloudNodeMQTTClient:
             "filename": filename,
         }
 
-        logger.debug(
-            f"Requesting signed URL for workload {workload_uuid}, filename: {filename}"
-        )
+        logger.debug(f"Requesting signed URL for workload {workload_uuid}, filename: {filename}")
 
         response = await self.publish_request(topic, payload, timeout=timeout)
 
@@ -864,9 +908,7 @@ class CloudNodeMQTTClient:
             else:
                 raise MQTTError("Signed URL request failed: No signed_url in response")
 
-        logger.debug(
-            f"Received signed URL for workload {workload_uuid}, filename: {filename}"
-        )
+        logger.debug(f"Received signed URL for workload {workload_uuid}, filename: {filename}")
         return response
 
     async def upload_workload_results(
@@ -905,8 +947,7 @@ class CloudNodeMQTTClient:
         }
 
         logger.info(
-            f"Uploading results for workload {workload_uuid} via MQTT "
-            f"({len(filenames)} file(s))"
+            f"Uploading results for workload {workload_uuid} via MQTT ({len(filenames)} file(s))"
         )
 
         response = await self.publish_request(topic, payload, timeout=timeout)

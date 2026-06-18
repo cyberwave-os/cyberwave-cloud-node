@@ -7,9 +7,8 @@ This module handles communication with the Cyberwave backend API for:
 """
 
 import logging
-import uuid as uuid_lib
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 
@@ -17,12 +16,10 @@ from .config import (
     CLOUD_NODE_CREATE_INSTANCE_ENDPOINT,
     CLOUD_NODE_FAILED_ENDPOINT,
     CLOUD_NODE_HEARTBEAT_ENDPOINT,
+    CLOUD_NODE_LIST_INSTANCES_ENDPOINT,
     CLOUD_NODE_LOG_ENDPOINT,
     CLOUD_NODE_REGISTER_ENDPOINT,
     CLOUD_NODE_TERMINATED_ENDPOINT,
-    CLOUD_NODE_WORKLOAD_COMPLETE_ENDPOINT,
-    CLOUD_NODE_WORKLOAD_FAIL_ENDPOINT,
-    CLOUD_NODE_WORKLOAD_UPDATE_ENDPOINT,
     get_api_token,
     get_api_url,
     get_instance_uuid,
@@ -177,6 +174,53 @@ class CloudNodeClient:
     def close(self):
         """Close the HTTP client."""
         self._client.close()
+
+    def validate_credentials(self) -> None:
+        """Verify the configured API token is accepted by the backend.
+
+        Performs a single lightweight authenticated GET so that an invalid or
+        revoked ``CYBERWAVE_API_KEY`` fails loudly at startup instead of the
+        node silently looping on MQTT heartbeat rejections. The MQTT broker
+        authenticates against the same ``cw_...`` APIToken, so a REST 401/403
+        here reliably predicts that registration and heartbeats would be
+        denied over MQTT too.
+
+        Raises:
+            CloudNodeClientError: with ``status_code`` 401/403 when the token
+                is rejected. Connection errors and other unexpected statuses
+                are raised with the corresponding ``status_code`` (or ``None``)
+                so callers can treat a transient backend outage as non-fatal.
+        """
+        params = {}
+        if self.workspace_slug:
+            params["workspace_slug"] = self.workspace_slug
+
+        try:
+            response = self._client.get(CLOUD_NODE_LIST_INSTANCES_ENDPOINT, params=params)
+        except httpx.RequestError as e:
+            raise CloudNodeClientError(
+                f"Could not reach the backend at {self.base_url} to validate credentials: {e}",
+                status_code=None,
+            ) from e
+
+        if response.status_code < 400:
+            return
+
+        if response.status_code in (401, 403):
+            raise CloudNodeClientError(
+                f"API token rejected by the backend (HTTP {response.status_code}). "
+                "CYBERWAVE_API_KEY is invalid, revoked, or lacks workspace access. "
+                "The MQTT broker uses the same token, so registration and heartbeats "
+                "would also be denied. Provide a valid cw_... APIToken.",
+                status_code=response.status_code,
+            )
+
+        # Any other status (e.g. 404/500) is not a clear auth failure; surface
+        # it but let the caller decide whether to treat it as fatal.
+        raise CloudNodeClientError(
+            f"Unexpected response while validating credentials: HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
 
     def create_instance(
         self,
@@ -742,9 +786,7 @@ class CloudNodeClient:
 
         raise CloudNodeClientError("Failed to upload workload results")
 
-    def complete_workload(
-        self, workload_uuid: str, workspace_slug: Optional[str] = None
-    ) -> dict:
+    def complete_workload(self, workload_uuid: str, workspace_slug: Optional[str] = None) -> dict:
         """Mark a workload as completed.
 
         Args:

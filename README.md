@@ -77,6 +77,8 @@ The Cloud Node needs an API token to communicate with Cyberwave. You can provide
 
 If you've already logged in with `cyberwave-cli`, the Cloud Node will automatically use those credentials.
 
+On `start`, the node validates the token against the backend before connecting to MQTT. If the token is invalid or revoked, it exits immediately with a clear error (HTTP 401/403) instead of silently looping on rejected heartbeats. A transient backend outage is logged as a warning and does not block startup.
+
 ## Environment Variables
 
 ### Required
@@ -304,7 +306,7 @@ Training and inference jobs run as **independent OS processes** that survive Clo
    - Collects results when processes complete
    - Publishes completion status and output back via MQTT
 
-3. **Node Capacity & Status**: 
+3. **Node Capacity & Status**:
    - Cloud Node tracks active workloads by PID
    - Rejects new workloads when busy (configurable for concurrent workloads)
    - Status command returns:
@@ -408,10 +410,10 @@ cyberwave manifest validate cyberwave.yml --lenient
 ## MuJoCo Docker Example
 
 Inside this monorepo there is a runnable local example for the `simulate`
-command at `cyberwave-cloud-nodes/tests/mujoco-sim/`. It starts:
+command at `cyberwave-cloud-nodes/tests/cyberwave-sim/`. It starts:
 
 - a `cyberwave-cloud-node` worker container
-- a MuJoCo simulator container
+- a simulation service container (cyberwave-sim)
 
 Use that example when you want your local machine to behave like a real
 simulation cloud node with minimal manual setup.

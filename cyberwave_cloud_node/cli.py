@@ -13,6 +13,7 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 
+from .client import CloudNodeClient, CloudNodeClientError
 from .cloud_node import CloudNode, CloudNodeError
 from .config import (
     CloudNodeConfig,
@@ -41,9 +42,7 @@ def init_sentry() -> None:
             traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "1.0")),
             # Set profiles_sample_rate to profile 100% of sampled transactions.
             # We recommend adjusting this value in production.
-            profiles_sample_rate=float(
-                os.environ.get("SENTRY_PROFILES_SAMPLE_RATE", "1.0")
-            ),
+            profiles_sample_rate=float(os.environ.get("SENTRY_PROFILES_SAMPLE_RATE", "1.0")),
             environment=os.environ.get("ENVIRONMENT", "local"),
             profile_session_sample_rate=float(
                 os.environ.get("SENTRY_PROFILE_SESSION_SAMPLE_RATE", "1.0")
@@ -169,7 +168,7 @@ def main() -> int:
     args = parser.parse_args()
 
     setup_logging(args.verbose)
-    
+
     if args.command is None:
         parser.print_help()
         return 1
@@ -211,6 +210,26 @@ def start_node(args: argparse.Namespace) -> int:
             "Get your token from https://cyberwave.com/profile"
         )
         return 1
+
+    # Validate the token against the backend BEFORE entering the MQTT heartbeat
+    # loop. A present-but-invalid token authenticates nowhere (REST and the MQTT
+    # broker share the same cw_... APIToken), so without this check the node
+    # silently spams "Heartbeat failed" forever and never registers as ready.
+    # Fail loudly and immediately on a clear auth rejection instead.
+    try:
+        with CloudNodeClient() as probe:
+            probe.validate_credentials()
+    except CloudNodeClientError as exc:
+        if exc.status_code in (401, 403):
+            logger.error(
+                "CYBERWAVE_API_KEY was rejected by the backend (HTTP %s): %s",
+                exc.status_code,
+                exc,
+            )
+            return 1
+        # Backend unreachable or an unexpected status: don't block startup on a
+        # transient condition; the node's normal retry/backoff will handle it.
+        logger.warning("Could not validate API token at startup: %s", exc)
 
     try:
         # Load config

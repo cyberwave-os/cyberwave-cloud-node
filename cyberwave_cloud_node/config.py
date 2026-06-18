@@ -14,6 +14,7 @@ from . import credentials as creds_module  # noqa: E402
 # API Configuration
 DEFAULT_BASE_URL = "https://api.cyberwave.com"
 CLOUD_NODE_CREATE_INSTANCE_ENDPOINT = "/api/v1/cloud-node"
+CLOUD_NODE_LIST_INSTANCES_ENDPOINT = "/api/v1/cloud-node/instances"
 CLOUD_NODE_REGISTER_ENDPOINT = "/api/v1/cloud-node/{uuid}/register"
 CLOUD_NODE_HEARTBEAT_ENDPOINT = "/api/v1/cloud-node/{uuid}/heartbeat"
 CLOUD_NODE_TERMINATED_ENDPOINT = "/api/v1/cloud-node/terminated"
@@ -295,9 +296,7 @@ class CloudNodeConfig:
             mqtt_host=cloud_node_data.get("mqtt_host", get_mqtt_host()),
             mqtt_port=mqtt_port,
             mqtt_use_tls=mqtt_use_tls,
-            mqtt_tls_ca_certs=cloud_node_data.get(
-                "mqtt_tls_ca_certs", get_mqtt_tls_ca_certs()
-            ),
+            mqtt_tls_ca_certs=cloud_node_data.get("mqtt_tls_ca_certs", get_mqtt_tls_ca_certs()),
             mqtt_username=cloud_node_data.get("mqtt_username", get_mqtt_username()),
             mqtt_password=cloud_node_data.get("mqtt_password", get_mqtt_password()),
             upload_results=cloud_node_data.get("upload_results", True),

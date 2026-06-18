@@ -18,8 +18,10 @@ sys.modules.setdefault("paho.mqtt.properties", unittest.mock.Mock())
 
 from cyberwave_cloud_node import cli  # noqa: E402
 from cyberwave_cloud_node import config as config_module  # noqa: E402
-from cyberwave_cloud_node.credentials import Credentials  # noqa: E402
-from cyberwave_cloud_node.credentials import _resolve_config_dir  # noqa: E402
+from cyberwave_cloud_node.credentials import (
+    Credentials,  # noqa: E402
+    _resolve_config_dir,  # noqa: E402
+)
 
 
 class CLIVersionTests(unittest.TestCase):
@@ -156,8 +158,9 @@ class StoredCredentialsRuntimeEnvTests(unittest.TestCase):
 
 
 class StartNodeTests(unittest.TestCase):
-    def test_start_node_logs_instance_uuid_from_helper(self) -> None:
-        args = SimpleNamespace(
+    @staticmethod
+    def _args() -> SimpleNamespace:
+        return SimpleNamespace(
             config=None,
             profile=None,
             mqtt_host=None,
@@ -165,14 +168,18 @@ class StartNodeTests(unittest.TestCase):
             slug=None,
         )
 
-        config = SimpleNamespace(
-            profile_slug="mujoco-sim",
+    @staticmethod
+    def _config() -> SimpleNamespace:
+        return SimpleNamespace(
+            profile_slug="cyberwave-sim",
             mqtt_host="localhost",
             mqtt_port=1883,
             inference=None,
             simulate=None,
             training=None,
         )
+
+    def test_start_node_logs_instance_uuid_from_helper(self) -> None:
         logger = unittest.mock.Mock()
         node = unittest.mock.Mock()
 
@@ -180,15 +187,68 @@ class StartNodeTests(unittest.TestCase):
             patch("cyberwave_cloud_node.cli.load_dotenv_files"),
             patch("cyberwave_cloud_node.cli.init_sentry"),
             patch("cyberwave_cloud_node.cli.get_api_token", return_value="token-123"),
+            patch("cyberwave_cloud_node.cli.CloudNodeClient"),
             patch("cyberwave_cloud_node.cli.get_instance_slug", return_value=None),
             patch("cyberwave_cloud_node.cli.get_instance_uuid", return_value="instance-123"),
-            patch("cyberwave_cloud_node.cli.CloudNodeConfig.from_file", side_effect=FileNotFoundError),
-            patch("cyberwave_cloud_node.cli.CloudNodeConfig.from_env", return_value=config),
+            patch(
+                "cyberwave_cloud_node.cli.CloudNodeConfig.from_file", side_effect=FileNotFoundError
+            ),
+            patch("cyberwave_cloud_node.cli.CloudNodeConfig.from_env", return_value=self._config()),
             patch("cyberwave_cloud_node.cli.CloudNode", return_value=node),
             patch("cyberwave_cloud_node.cli.logging.getLogger", return_value=logger),
         ):
-            result = cli.start_node(args)
+            result = cli.start_node(self._args())
 
         self.assertEqual(result, 0)
         logger.info.assert_any_call("Instance UUID: instance-123")
         node.run.assert_called_once_with()
+
+    def test_start_node_fails_fast_when_token_rejected(self) -> None:
+        logger = unittest.mock.Mock()
+        node = unittest.mock.Mock()
+
+        with (
+            patch("cyberwave_cloud_node.cli.load_dotenv_files"),
+            patch("cyberwave_cloud_node.cli.init_sentry"),
+            patch("cyberwave_cloud_node.cli.get_api_token", return_value="cw_bad"),
+            patch("cyberwave_cloud_node.cli.CloudNodeClient") as mock_client_cls,
+            patch("cyberwave_cloud_node.cli.CloudNode", return_value=node),
+            patch("cyberwave_cloud_node.cli.logging.getLogger", return_value=logger),
+        ):
+            probe = mock_client_cls.return_value.__enter__.return_value
+            probe.validate_credentials.side_effect = cli.CloudNodeClientError(
+                "rejected", status_code=401
+            )
+            result = cli.start_node(self._args())
+
+        self.assertEqual(result, 1)
+        node.run.assert_not_called()
+        logger.error.assert_called()
+
+    def test_start_node_proceeds_when_backend_unreachable(self) -> None:
+        logger = unittest.mock.Mock()
+        node = unittest.mock.Mock()
+
+        with (
+            patch("cyberwave_cloud_node.cli.load_dotenv_files"),
+            patch("cyberwave_cloud_node.cli.init_sentry"),
+            patch("cyberwave_cloud_node.cli.get_api_token", return_value="cw_ok"),
+            patch("cyberwave_cloud_node.cli.CloudNodeClient") as mock_client_cls,
+            patch("cyberwave_cloud_node.cli.get_instance_slug", return_value=None),
+            patch("cyberwave_cloud_node.cli.get_instance_uuid", return_value="instance-123"),
+            patch(
+                "cyberwave_cloud_node.cli.CloudNodeConfig.from_file", side_effect=FileNotFoundError
+            ),
+            patch("cyberwave_cloud_node.cli.CloudNodeConfig.from_env", return_value=self._config()),
+            patch("cyberwave_cloud_node.cli.CloudNode", return_value=node),
+            patch("cyberwave_cloud_node.cli.logging.getLogger", return_value=logger),
+        ):
+            probe = mock_client_cls.return_value.__enter__.return_value
+            probe.validate_credentials.side_effect = cli.CloudNodeClientError(
+                "backend unreachable", status_code=None
+            )
+            result = cli.start_node(self._args())
+
+        self.assertEqual(result, 0)
+        node.run.assert_called_once_with()
+        logger.warning.assert_called()

@@ -39,7 +39,12 @@ from .config import (
     get_instance_slug,
     get_instance_uuid,
 )
-from .mqtt import CloudNodeAuthError, CloudNodeMQTTClient, MQTTError
+from .mqtt import (
+    CloudNodeAuthError,
+    CloudNodeInstanceGoneError,
+    CloudNodeMQTTClient,
+    MQTTError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +125,7 @@ class CloudNode:
         node.run()
     """
 
-    CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES = frozenset({"simulate"})
+    CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES = frozenset({"simulate", "inference"})
 
     def __init__(
         self,
@@ -822,7 +827,51 @@ class CloudNode:
                 process.send_signal(sig)
 
             if cancellation_counts_as_success:
-                return True, f"Workload cancellation requested with {signal_name}"
+                # Wait for process to actually die (critical for controller safety)
+                for _ in range(25):  # 25 * 0.2s = 5s
+                    await asyncio.sleep(0.2)
+                    if not self._is_process_alive(workload.pid):
+                        break
+
+                if self._is_process_alive(workload.pid):
+                    logger.warning(
+                        f"Process {workload.pid} survived SIGTERM after 5s, escalating to SIGKILL"
+                    )
+                    try:
+                        if hasattr(os, "killpg"):
+                            os.killpg(workload.pid, signal.SIGKILL)
+                        else:
+                            psutil.Process(workload.pid).kill()
+                    except (ProcessLookupError, psutil.NoSuchProcess):
+                        pass
+                    # Wait briefly for SIGKILL
+                    for _ in range(10):  # 10 * 0.2s = 2s
+                        await asyncio.sleep(0.2)
+                        if not self._is_process_alive(workload.pid):
+                            break
+
+                # Remove from active workloads
+                async with self._workload_lock:
+                    self._active_workloads.pop(workload.pid, None)
+
+                # Notify backend
+                if workload.workload_uuid and self._mqtt_client:
+                    try:
+                        await self._mqtt_client.update_workload_status(
+                            workload_uuid=workload.workload_uuid,
+                            status="cancelled",
+                            additional_data={
+                                "message": f"Workload cancelled by {signal_name}",
+                                "signal": signal_name,
+                                "pid": workload.pid,
+                            },
+                        )
+                    except Exception as notify_err:
+                        logger.warning(
+                            f"Failed to notify backend of workload cancellation: {notify_err}"
+                        )
+
+                return True, f"Workload cancelled with {signal_name}"
 
             # For SIGKILL, wait briefly to confirm termination
             if signal_name == "SIGKILL":
@@ -835,13 +884,18 @@ class CloudNode:
             async with self._workload_lock:
                 self._active_workloads.pop(workload.pid, None)
 
-            # Notify backend via the workload status channel so the workload is
-            # properly marked as FAILED rather than staying RUNNING forever.
+            # Notify backend — use "cancelled" for workload types where
+            # cancellation is a normal lifecycle outcome, "failed" for others.
             if workload.workload_uuid and self._mqtt_client:
+                report_status = (
+                    "cancelled"
+                    if workload.workload_type in self.CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES
+                    else "failed"
+                )
                 try:
                     await self._mqtt_client.update_workload_status(
                         workload_uuid=workload.workload_uuid,
-                        status="failed",
+                        status=report_status,
                         additional_data={
                             "message": f"Workload cancelled by {signal_name}",
                             "signal": signal_name,
@@ -1391,6 +1445,44 @@ class CloudNode:
                     break
                 yield chunk
 
+    @staticmethod
+    def _bounded_tail(text: str, max_chars: int = 2000) -> str | None:
+        """Return the trailing ``max_chars`` of ``text`` (stripped), or None."""
+        if not text or not text.strip():
+            return None
+        tail = text.strip()[-max_chars:]
+        return tail
+
+    @staticmethod
+    def _summarize_failure(
+        *,
+        stderr_content: str,
+        stdout_content: str,
+        exit_code: int | None,
+        workload_type: str,
+    ) -> str:
+        """Build a short, human-readable failure summary.
+
+        Prefers the last meaningful stderr line, then the last stdout line,
+        then a generic exit-code message.
+        """
+
+        def _last_meaningful_line(text: str) -> str | None:
+            if not text:
+                return None
+            for line in reversed(text.strip().splitlines()):
+                stripped = line.strip()
+                if stripped:
+                    return stripped[:300]
+            return None
+
+        line = _last_meaningful_line(stderr_content) or _last_meaningful_line(stdout_content)
+        if line:
+            return line
+        if exit_code is not None:
+            return f"{workload_type} exited with code {exit_code}."
+        return f"{workload_type} failed before reporting an exit code."
+
     async def _handle_workload_completion(
         self, workload: ActiveWorkload, exit_code: int | None = None
     ) -> None:
@@ -1410,6 +1502,8 @@ class CloudNode:
                     workload.pid,
                 )
                 return
+
+            await self._save_workload_state()
 
             cancellation_counts_as_success = (
                 self._cancellation_counts_as_success(workload.workload_type)
@@ -1468,6 +1562,20 @@ class CloudNode:
                 f"Workload {workload.workload_type} (PID {workload.pid}) completed: "
                 f"exit_code={exit_code}, duration={duration:.1f}s, success={success}"
             )
+            # Build a bounded failure detail (preserved before log files are
+            # deleted below) so the backend and frontend can show an actionable
+            # reason instead of only ``exit_code=1``.
+            failure_error: str | None = None
+            failure_stderr: str | None = None
+            if not success:
+                failure_stderr = self._bounded_tail(stderr_content, max_chars=2000)
+                failure_error = self._summarize_failure(
+                    stderr_content=stderr_content,
+                    stdout_content=stdout_content,
+                    exit_code=exit_code,
+                    workload_type=workload.workload_type,
+                )
+
             # Publish results
             result_data = {
                 "message": (
@@ -1481,6 +1589,10 @@ class CloudNode:
                 "exit_code": exit_code,
                 "duration_seconds": duration,
             }
+            if failure_error:
+                result_data["error"] = failure_error
+            if failure_stderr:
+                result_data["stderr"] = failure_stderr
 
             if stdout_content:
                 # Send stdout via log streaming
@@ -1526,21 +1638,36 @@ class CloudNode:
                         success=success,
                         exit_code=exit_code,
                         timeout=30.0,
+                        error=failure_error,
+                        stderr=failure_stderr,
                     )
                     logger.info(f"Workload {workload.workload_uuid} completion notified via MQTT")
                 except (MQTTError, asyncio.TimeoutError) as e:
                     logger.error(f"Failed to notify workload completion via MQTT: {e}")
 
-            # Clean up workload files (log files and params file)
-            workload.stdout_file.unlink(missing_ok=True)
-            workload.stderr_file.unlink(missing_ok=True)
+            # Clean up workload files (log files and params file).
+            # On failure, KEEP the stdout/stderr/params on disk so the crash is
+            # diagnosable after the fact — the bounded stderr tail published over
+            # MQTT is often empty or truncated, and deleting the files leaves no
+            # way to recover the real traceback (see resolve_failure_detail).
+            if success:
+                workload.stdout_file.unlink(missing_ok=True)
+                workload.stderr_file.unlink(missing_ok=True)
 
-            # Clean up params file (has same base name as stdout file but with .params.json)
-            params_file = (
-                workload.stdout_file.parent
-                / f"{workload.stdout_file.stem.replace('.stdout', '')}.params.json"
-            )
-            params_file.unlink(missing_ok=True)
+                # Clean up params file (same base name as stdout, .params.json)
+                params_file = (
+                    workload.stdout_file.parent
+                    / f"{workload.stdout_file.stem.replace('.stdout', '')}.params.json"
+                )
+                params_file.unlink(missing_ok=True)
+            else:
+                logger.warning(
+                    "Workload %s failed (exit_code=%s); preserving logs for diagnosis: %s , %s",
+                    workload.workload_uuid or workload.workload_type,
+                    exit_code,
+                    workload.stdout_file,
+                    workload.stderr_file,
+                )
 
         except Exception as e:
             logger.error(f"Error handling workload completion: {e}", exc_info=True)
@@ -1939,12 +2066,12 @@ class CloudNode:
                 self.slug = register_response.payload.get("slug", instance_slug) or ""
 
                 if not self.instance_uuid:
-                    raise CloudNodeError(f"Invalid registration response: missing uuid")
+                    raise CloudNodeError("Invalid registration response: missing uuid")
 
                 # If slug is empty, generate a fallback slug from uuid (shouldn't happen with backend fix, but safety measure)
                 if not self.slug:
                     logger.warning(
-                        f"Registration response missing slug, using uuid-based fallback slug"
+                        "Registration response missing slug, using uuid-based fallback slug"
                     )
                     self.slug = f"cn-{self.instance_uuid[:8]}"
 
@@ -1958,6 +2085,33 @@ class CloudNode:
 
         # If we exit the loop because _running became False, raise an error
         raise CloudNodeError("Registration aborted due to shutdown")
+
+    async def _reregister(self) -> None:
+        """Re-register a fresh instance after the backend reaped the old one.
+
+        Invoked when a heartbeat reports the instance is gone/terminated — e.g.
+        it was reaped as stale while the node was disconnected from the broker.
+        Clears the dead UUID (forcing ``_register_via_mqtt`` to create a brand
+        new instance), drops the stale command subscription, then registers and
+        re-subscribes under the new UUID. Without this the node would heartbeat
+        a dead UUID forever and never accept work again.
+        """
+        old_uuid = self.instance_uuid
+        logger.warning("Instance %s is gone on the backend; re-registering.", old_uuid)
+
+        if old_uuid and self._mqtt_client:
+            old_command_topic = f"{self._topic_prefix}cyberwave/cloud-node/{old_uuid}/command"
+            self._mqtt_client.unsubscribe_command(old_command_topic)
+
+        # Force creation of a new instance — the old UUID no longer exists.
+        self.instance_uuid = ""
+        await self._register_via_mqtt()
+        await self._subscribe_to_commands()
+        logger.info(
+            "Re-registration complete; now serving as instance %s (was %s).",
+            self.instance_uuid,
+            old_uuid,
+        )
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to the backend via MQTT."""
@@ -1985,6 +2139,22 @@ class CloudNode:
                 )
                 self._running = False
                 return
+
+            except CloudNodeInstanceGoneError as e:
+                logger.warning(
+                    f"{e} Re-registering a fresh instance so the node can accept work again."
+                )
+                try:
+                    await self._reregister()
+                except Exception as reg_err:
+                    logger.error(
+                        f"Re-registration after instance-gone failed: {reg_err}. "
+                        "Will retry on the next heartbeat.",
+                        exc_info=True,
+                    )
+                # Heartbeat the new instance promptly rather than waiting a full
+                # interval; skip the sleep below.
+                continue
 
             except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(f"Heartbeat failed: {e}")

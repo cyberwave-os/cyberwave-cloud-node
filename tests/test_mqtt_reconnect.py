@@ -40,24 +40,18 @@ mock_httpx.TimeoutException = Exception
 mock_httpx.Response = Mock
 sys.modules.setdefault("httpx", mock_httpx)
 
-from cyberwave_cloud_node.cloud_node import ActiveWorkload, CloudNode
-from cyberwave_cloud_node.config import CloudNodeConfig
-from cyberwave_cloud_node.mqtt import CloudNodeMQTTClient
+from cyberwave_cloud_node.cloud_node import ActiveWorkload, CloudNode  # noqa: E402
+from cyberwave_cloud_node.config import CloudNodeConfig  # noqa: E402
+from cyberwave_cloud_node.mqtt import CloudNodeInstanceGoneError, CloudNodeMQTTClient  # noqa: E402
 
 
 class MQTTReconnectTests(unittest.TestCase):
     def test_config_reads_simulate_command(self) -> None:
         config = CloudNodeConfig.from_dict(
-            {
-                "cyberwave-cloud-node": {
-                    "simulate": "python run_mujoco_workload.py --params {body}"
-                }
-            }
+            {"cyberwave-cloud-node": {"simulate": "python run_sim_workload.py --params {body}"}}
         )
 
-        self.assertEqual(
-            config.simulate, "python run_mujoco_workload.py --params {body}"
-        )
+        self.assertEqual(config.simulate, "python run_sim_workload.py --params {body}")
 
     def test_config_reads_mqtt_username_from_environment(self) -> None:
         original = os.environ.get("CYBERWAVE_MQTT_USERNAME")
@@ -137,7 +131,7 @@ class MQTTReconnectTests(unittest.TestCase):
             ):
                 node = CloudNode(
                     config=CloudNodeConfig(mqtt_password="api-token"),
-                    slug="mujoco-sim-worker",
+                    slug="cyberwave-sim-worker",
                     client=Mock(),
                     working_dir=Path(tmp_dir),
                 )
@@ -155,9 +149,7 @@ class MQTTReconnectTests(unittest.TestCase):
             ):
                 asyncio.run(node._connect_mqtt())
 
-        self.assertEqual(
-            mock_client_cls.call_args.kwargs["username"], "mujoco-sim-worker"
-        )
+        self.assertEqual(mock_client_cls.call_args.kwargs["username"], "cyberwave-sim-worker")
         mock_mqtt_client.connect.assert_awaited_once()
 
     def test_cloud_node_uses_stored_environment_for_topic_prefix(self) -> None:
@@ -322,13 +314,9 @@ class MQTTReconnectTests(unittest.TestCase):
     def test_resubscribes_command_topics_on_reconnect(self) -> None:
         mock_paho_client = Mock()
         mock_paho_client.subscribe.return_value = (mqtt.MQTT_ERR_SUCCESS, 1)
-        mock_paho_client.message_callback_remove.side_effect = KeyError(
-            "missing callback"
-        )
+        mock_paho_client.message_callback_remove.side_effect = KeyError("missing callback")
 
-        with patch(
-            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
-        ):
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
             client = CloudNodeMQTTClient(host="mqtt.example.com", port=1883)
 
         client._connected = True
@@ -365,14 +353,77 @@ class MQTTReconnectTests(unittest.TestCase):
     def test_configures_paho_reconnect_backoff(self) -> None:
         mock_paho_client = Mock()
 
-        with patch(
-            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
-        ):
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
             CloudNodeMQTTClient(host="mqtt.example.com", port=1883)
 
-        mock_paho_client.reconnect_delay_set.assert_called_once_with(
-            min_delay=2, max_delay=3600
+        mock_paho_client.reconnect_delay_set.assert_called_once_with(min_delay=2, max_delay=3600)
+
+    def test_send_heartbeat_raises_instance_gone_on_404(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
+            client = CloudNodeMQTTClient(host="mqtt.example.com", port=1883)
+
+        client.publish_request = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                payload={"code": 404, "message": "Instance abc not found"},
+            )
         )
+
+        with self.assertRaises(CloudNodeInstanceGoneError):
+            asyncio.run(client.send_heartbeat("abc"))
+
+    def test_send_heartbeat_raises_instance_gone_when_terminated(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
+            client = CloudNodeMQTTClient(host="mqtt.example.com", port=1883)
+
+        client.publish_request = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                payload={
+                    "code": 400,
+                    "message": "Cannot record heartbeat for instance abc: instance is terminated",
+                },
+            )
+        )
+
+        with self.assertRaises(CloudNodeInstanceGoneError):
+            asyncio.run(client.send_heartbeat("abc"))
+
+    def test_heartbeat_loop_reregisters_when_instance_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(heartbeat_interval=0),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            node._running = True
+            node.instance_uuid = "dead-instance"
+            node._mqtt_client = AsyncMock()
+            # First heartbeat reports the instance is gone, then we stop the loop.
+            node._mqtt_client.send_heartbeat = AsyncMock(
+                side_effect=CloudNodeInstanceGoneError("gone")
+            )
+
+            reregistered = {"count": 0}
+
+            async def fake_reregister() -> None:
+                reregistered["count"] += 1
+                node._running = False  # stop after one recovery
+
+            node._reregister = fake_reregister  # type: ignore[assignment]
+
+            asyncio.run(node._heartbeat_loop())
+
+        self.assertEqual(reregistered["count"], 1)
 
     def test_mqtt_reconnect_loop_does_not_manually_reconnect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -424,7 +475,7 @@ class MQTTReconnectTests(unittest.TestCase):
                 request_id="simulate-request",
                 workload_type="simulate",
                 started_at=0.0,
-                command="python run_mujoco_workload.py",
+                command="python run_sim_workload.py",
                 stdout_file=stdout_file,
                 stderr_file=stderr_file,
                 params={},
@@ -470,7 +521,7 @@ class MQTTReconnectTests(unittest.TestCase):
                 request_id="simulate-group-request",
                 workload_type="simulate",
                 started_at=0.0,
-                command="python run_mujoco_workload.py",
+                command="python run_sim_workload.py",
                 stdout_file=stdout_file,
                 stderr_file=stderr_file,
                 params={},
@@ -660,7 +711,7 @@ class MQTTReconnectTests(unittest.TestCase):
                 request_id="simulate-request",
                 workload_type="simulate",
                 started_at=0.0,
-                command="python run_mujoco_workload.py",
+                command="python run_sim_workload.py",
                 stdout_file=stdout_file,
                 stderr_file=stderr_file,
                 params={},
@@ -687,9 +738,7 @@ class MQTTReconnectTests(unittest.TestCase):
     def test_complete_workload_publishes_success_metadata(self) -> None:
         mock_paho_client = Mock()
 
-        with patch(
-            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
-        ):
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
             client = CloudNodeMQTTClient(
                 host="mqtt.example.com",
                 port=1883,
@@ -697,9 +746,7 @@ class MQTTReconnectTests(unittest.TestCase):
                 topic_prefix="local",
             )
 
-        client.publish_request = AsyncMock(
-            return_value=SimpleNamespace(success=True, payload={})
-        )
+        client.publish_request = AsyncMock(return_value=SimpleNamespace(success=True, payload={}))
 
         asyncio.run(client.complete_workload("workload-123", success=False, exit_code=1))
 
@@ -712,9 +759,7 @@ class MQTTReconnectTests(unittest.TestCase):
     def test_matches_response_correlation_data_when_bytearray(self) -> None:
         mock_paho_client = Mock()
 
-        with patch(
-            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
-        ):
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
             client = CloudNodeMQTTClient(
                 host="mqtt.example.com",
                 port=1883,
@@ -749,9 +794,7 @@ class MQTTReconnectTests(unittest.TestCase):
     def test_logs_unmatched_response_details(self) -> None:
         mock_paho_client = Mock()
 
-        with patch(
-            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
-        ):
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
             client = CloudNodeMQTTClient(
                 host="mqtt.example.com",
                 port=1883,
@@ -776,9 +819,7 @@ class MQTTReconnectTests(unittest.TestCase):
     def test_logs_response_topic_even_without_properties(self) -> None:
         mock_paho_client = Mock()
 
-        with patch(
-            "cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client
-        ):
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
             client = CloudNodeMQTTClient(
                 host="mqtt.example.com",
                 port=1883,
