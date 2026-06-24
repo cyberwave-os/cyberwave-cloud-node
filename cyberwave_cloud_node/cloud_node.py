@@ -32,6 +32,9 @@ import psutil
 
 from .client import CloudNodeClient, CloudNodeClientError
 from .config import (
+    HEARTBEAT_AUTH_RETRY_BASE_SECONDS,
+    HEARTBEAT_AUTH_RETRY_MAX_SECONDS,
+    MAX_HEARTBEAT_AUTH_RETRIES,
     CloudNodeConfig,
     clean_subprocess_env,
     get_api_token,
@@ -321,12 +324,18 @@ class CloudNode:
             logger.info("Received keyboard interrupt, shutting down gracefully")
             # Don't mark as failed for keyboard interrupt
         except Exception as e:
-            logger.error(f"Cloud Node error: {e}", exc_info=True)
+            # A failure here (install/MQTT/registration during startup, or a fatal
+            # error while running) is fatal. Log it unmistakably and re-raise so the
+            # process exits non-zero — otherwise a failed start (e.g. the install
+            # script failing) would log a buried error and exit 0, leaving the
+            # operator with a node that "did nothing" and a UI stuck on
+            # "Waiting for cloud node". The `finally` block below still runs cleanup.
+            logger.critical(f"Cloud node failed to start / crashed: {e}", exc_info=True)
             try:
                 await self._notify_failed(str(e))
             except Exception as notify_error:
                 logger.error(f"Failed to notify backend of failure: {notify_error}")
-            # Don't re-raise - let shutdown happen gracefully
+            raise
 
         finally:
             try:
@@ -2117,6 +2126,14 @@ class CloudNode:
         """Send periodic heartbeats to the backend via MQTT."""
         logger.info(f"Starting heartbeat loop (interval: {self.config.heartbeat_interval}s)")
 
+        # Track consecutive failures so a transient blip is tolerated while a
+        # persistent problem still surfaces (and, for auth, ends in a clean exit).
+        consecutive_auth_failures = 0
+        consecutive_delivery_failures = 0
+        # Roughly the backend's READY stale window — once delivery has been
+        # failing this long the instance is about to be reaped, so escalate.
+        delivery_failures_before_alert = max(1, 120 // max(1, self.config.heartbeat_interval))
+
         while self._running:
             try:
                 if self._mqtt_client:
@@ -2125,19 +2142,48 @@ class CloudNode:
                         timeout=10.0,
                     )
                     logger.debug(f"Heartbeat sent via MQTT: {response.payload.get('message')}")
+                    # A successful heartbeat clears both failure counters.
+                    consecutive_auth_failures = 0
+                    consecutive_delivery_failures = 0
                 else:
                     logger.warning("MQTT client not available for heartbeat")
 
             except CloudNodeAuthError as e:
+                consecutive_auth_failures += 1
+                if consecutive_auth_failures < MAX_HEARTBEAT_AUTH_RETRIES:
+                    backoff = min(
+                        HEARTBEAT_AUTH_RETRY_BASE_SECONDS * (2 ** (consecutive_auth_failures - 1)),
+                        HEARTBEAT_AUTH_RETRY_MAX_SECONDS,
+                    )
+                    logger.warning(
+                        "Heartbeat authentication failed (attempt %d/%d): %s. "
+                        "Retrying in %.1fs in case the token is still propagating.",
+                        consecutive_auth_failures,
+                        MAX_HEARTBEAT_AUTH_RETRIES,
+                        e,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
+                # Token is persistently rejected — shut down cleanly rather than
+                # lingering as a zombie that no longer heartbeats (the backend
+                # would reap the instance anyway, just more confusingly).
                 logger.error(
-                    f"Heartbeat authentication failed — API token is invalid or revoked: {e}"
+                    "Heartbeat authentication has failed %d times — the API token "
+                    "is invalid or revoked: %s",
+                    consecutive_auth_failures,
+                    e,
                 )
                 logger.error(
-                    "The backend has rejected this cloud node's API token. "
-                    "Stop this process and restart with a valid CYBERWAVE_API_KEY "
-                    "(run start-local-cloud-node.sh after generating a fresh token)."
+                    "Shutting down the cloud node. Restart with a valid "
+                    "CYBERWAVE_API_KEY (run start-local-cloud-node.sh after "
+                    "generating a fresh token)."
                 )
                 self._running = False
+                # Unblock run_async()'s `await self._shutdown_event.wait()` so the
+                # process exits and normal cleanup runs.
+                self._shutdown_event.set()
                 return
 
             except CloudNodeInstanceGoneError as e:
@@ -2152,13 +2198,27 @@ class CloudNode:
                         "Will retry on the next heartbeat.",
                         exc_info=True,
                     )
+                # A fresh instance resets the auth/delivery failure tracking.
+                consecutive_auth_failures = 0
+                consecutive_delivery_failures = 0
                 # Heartbeat the new instance promptly rather than waiting a full
                 # interval; skip the sleep below.
                 continue
 
             except (MQTTError, asyncio.TimeoutError) as e:
-                logger.warning(f"Heartbeat failed: {e}")
-                # Continue trying - the backend might be temporarily unavailable
+                consecutive_delivery_failures += 1
+                # Continue trying - the backend might be temporarily unavailable.
+                if consecutive_delivery_failures >= delivery_failures_before_alert:
+                    logger.error(
+                        "Heartbeat has failed to reach the backend %d times in a row "
+                        "(%s). The instance will likely be reaped as stale — check that "
+                        "the MQTT broker and the cloud-node MQTT consumer service are "
+                        "running.",
+                        consecutive_delivery_failures,
+                        e,
+                    )
+                else:
+                    logger.warning(f"Heartbeat failed: {e}")
 
             await asyncio.sleep(self.config.heartbeat_interval)
 
@@ -2348,7 +2408,7 @@ class CloudNode:
                     return_code=return_code,
                 )
             else:
-                logger.warning(f"Command failed with code {return_code}")
+                logger.error(f"Command failed with code {return_code}")
                 if stderr_str:
                     logger.error(f"Command stderr: {stderr_str}")
                 if stdout_str:

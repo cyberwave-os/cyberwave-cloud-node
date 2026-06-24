@@ -34,6 +34,15 @@ ENV_FILE_NAME = ".env"
 # Heartbeat interval in seconds
 DEFAULT_HEARTBEAT_INTERVAL = 30
 
+# Heartbeat auth-failure handling. A rejected API token (HTTP 401) is retried
+# with capped exponential backoff a bounded number of times before the node
+# gives up and shuts down cleanly (rather than lingering as a zombie that no
+# longer heartbeats and gets reaped by the backend). This tolerates a transient
+# 401 right after provisioning while still surfacing a genuinely revoked token.
+MAX_HEARTBEAT_AUTH_RETRIES = 5
+HEARTBEAT_AUTH_RETRY_BASE_SECONDS = 2.0
+HEARTBEAT_AUTH_RETRY_MAX_SECONDS = 30.0
+
 
 def load_dotenv_files(working_dir: Optional[Path] = None) -> None:
     """Load .env files from working directory and the Cyberwave config directory.

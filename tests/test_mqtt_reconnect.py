@@ -40,9 +40,17 @@ mock_httpx.TimeoutException = Exception
 mock_httpx.Response = Mock
 sys.modules.setdefault("httpx", mock_httpx)
 
-from cyberwave_cloud_node.cloud_node import ActiveWorkload, CloudNode  # noqa: E402
+from cyberwave_cloud_node.cloud_node import (  # noqa: E402
+    ActiveWorkload,
+    CloudNode,
+    CloudNodeError,
+)
 from cyberwave_cloud_node.config import CloudNodeConfig  # noqa: E402
-from cyberwave_cloud_node.mqtt import CloudNodeInstanceGoneError, CloudNodeMQTTClient  # noqa: E402
+from cyberwave_cloud_node.mqtt import (  # noqa: E402
+    CloudNodeAuthError,
+    CloudNodeInstanceGoneError,
+    CloudNodeMQTTClient,
+)
 
 
 class MQTTReconnectTests(unittest.TestCase):
@@ -424,6 +432,104 @@ class MQTTReconnectTests(unittest.TestCase):
             asyncio.run(node._heartbeat_loop())
 
         self.assertEqual(reregistered["count"], 1)
+
+    def test_heartbeat_loop_recovers_from_transient_auth_failure(self) -> None:
+        """A single 401 followed by success must NOT shut the node down."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(heartbeat_interval=0),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            node._running = True
+            node.instance_uuid = "inst-1"
+            node._mqtt_client = AsyncMock()
+
+            calls = {"count": 0}
+
+            async def flaky_heartbeat(*_args: object, **_kwargs: object) -> object:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise CloudNodeAuthError("token still propagating")
+                # Second heartbeat succeeds, then stop the loop.
+                node._running = False
+                return SimpleNamespace(payload={"message": "ok"})
+
+            node._mqtt_client.send_heartbeat = AsyncMock(side_effect=flaky_heartbeat)
+
+            # Avoid real backoff sleeps.
+            with patch("cyberwave_cloud_node.cloud_node.asyncio.sleep", AsyncMock()):
+                asyncio.run(node._heartbeat_loop())
+
+        self.assertEqual(calls["count"], 2)
+        # Recovered: the node did not trigger shutdown.
+        self.assertFalse(node._shutdown_event.is_set())
+
+    def test_heartbeat_loop_clean_exit_on_persistent_auth_failure(self) -> None:
+        """Sustained 401s must exhaust retries, then shut down cleanly
+        (set the shutdown event) instead of zombie-ing."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(heartbeat_interval=0),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            node._running = True
+            node.instance_uuid = "inst-1"
+            node._mqtt_client = AsyncMock()
+            node._mqtt_client.send_heartbeat = AsyncMock(
+                side_effect=CloudNodeAuthError("token revoked")
+            )
+
+            with patch("cyberwave_cloud_node.cloud_node.asyncio.sleep", AsyncMock()):
+                asyncio.run(node._heartbeat_loop())
+
+        # Loop exited and requested a clean shutdown.
+        self.assertFalse(node._running)
+        self.assertTrue(node._shutdown_event.is_set())
+        # Retried up to the bounded limit before giving up.
+        from cyberwave_cloud_node.config import MAX_HEARTBEAT_AUTH_RETRIES
+
+        self.assertEqual(node._mqtt_client.send_heartbeat.await_count, MAX_HEARTBEAT_AUTH_RETRIES)
+
+    def test_run_async_reraises_startup_failure(self) -> None:
+        """A startup failure (e.g. the install script failing) must propagate so the
+        process exits non-zero — previously it was swallowed and the node exited 0,
+        leaving the operator with a node that 'did nothing'. Cleanup still runs."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(heartbeat_interval=0, install_script="./install.sh"),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            node._manifest = None
+            node._setup_signal_handlers = Mock()
+            # Install (Step 1 of run_async) fails fatally.
+            node._run_install_script = AsyncMock(side_effect=CloudNodeError("install boom"))
+            node._notify_failed = AsyncMock()
+            node._shutdown = AsyncMock()
+
+            with self.assertRaises(CloudNodeError):
+                asyncio.run(node.run_async())
+
+            # Failure was surfaced (notify attempted) and cleanup still ran.
+            node._notify_failed.assert_awaited_once()
+            node._shutdown.assert_awaited_once()
 
     def test_mqtt_reconnect_loop_does_not_manually_reconnect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
