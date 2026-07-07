@@ -357,7 +357,19 @@ Workload output is streamed to:
 └── inference_<request_id>.stderr.log
 ```
 
-These files are also streamed to the backend in real-time for live monitoring.
+These files are also streamed to the backend **during the run** (not only at
+exit) for live monitoring: a background loop tails each active workload's
+stdout/stderr from the last-sent byte offset and forwards new content via the
+same `send_log` MQTT path (→ `NodeInstanceLog`). The completion/cancel handler
+sends only the remaining tail, so nothing is double-sent. This is what powers
+the frontend "Policy decision logs" panel for online RL inference.
+
+- `CYBERWAVE_WORKLOAD_LOG_STREAM_INTERVAL` (default `3`, seconds): cadence of the
+  live tail. Lower = more responsive panel, more MQTT traffic.
+- The periodic log-flush loop is now crash-resistant: a single unexpected error
+  no longer permanently stops log persistence (previously any exception other
+  than `MQTTError`/`TimeoutError` killed the flush loop and silenced all further
+  logs).
 
 ## Manifest Schema (CYB-1550)
 

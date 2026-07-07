@@ -819,6 +819,44 @@ class CloudNodeClient:
 
         raise CloudNodeClientError("Failed to complete workload")
 
+    def get_workload(
+        self, workload_uuid: str, workspace_slug: Optional[str] = None
+    ) -> Optional[dict]:
+        """Fetch a workload's current backend state (status, instance, ...).
+
+        Used by the Cloud Node to reconcile recovered local processes against
+        the backend on startup.
+
+        Returns:
+            The parsed workload dict on success, or ``None`` if the backend
+            reports the workload no longer exists (HTTP 404).
+
+        Raises:
+            CloudNodeClientError: for any other failure (auth, connection, 5xx).
+            Callers must distinguish "definitively gone" (``None``) from
+            "could not reach the backend" (raised) — an inconclusive check must
+            never be treated as terminal, or a healthy controller gets killed.
+        """
+        endpoint = f"/api/v1/cloud-node-workloads/{workload_uuid}"
+
+        ws_slug = workspace_slug or self.workspace_slug
+        params = {}
+        if ws_slug:
+            params["workspace_slug"] = ws_slug
+
+        try:
+            response = self._client.get(endpoint, params=params)
+        except httpx.RequestError as e:
+            raise CloudNodeClientError(f"Connection error during workload fetch: {e}") from e
+
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 404:
+            return None
+
+        self._handle_error_response(response, "get_workload")
+        return None
+
     def _handle_error_response(self, response: httpx.Response, operation: str) -> None:
         """Handle error responses from the API."""
         try:

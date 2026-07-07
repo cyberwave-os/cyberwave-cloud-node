@@ -100,6 +100,10 @@ class ActiveWorkload:
     cancel_requested: bool = False
     cancel_signal: Optional[str] = None
     completion_started: bool = False
+    # Byte offsets already streamed to the backend, so the live log streamer and
+    # the completion handler never re-send the same bytes (backend appends).
+    stdout_offset: int = 0
+    stderr_offset: int = 0
 
 
 class CloudNode:
@@ -164,6 +168,7 @@ class CloudNode:
         self._log_flush_task: Optional[asyncio.Task] = None
         self._mqtt_reconnect_task: Optional[asyncio.Task] = None
         self._workload_monitor_task: Optional[asyncio.Task] = None
+        self._workload_log_stream_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
 
         # Track active workloads by PID (process-based, survives restarts)
@@ -179,6 +184,11 @@ class CloudNode:
         self._stderr_buffer: list[str] = []
         self._log_buffer_lock = asyncio.Lock()
         self._log_flush_interval = 30  # seconds
+        # Live tail of active workloads' stdout/stderr files to the backend, so
+        # the frontend logs panel updates during a run (not just at exit).
+        self._workload_log_stream_interval = float(
+            os.environ.get("CYBERWAVE_WORKLOAD_LOG_STREAM_INTERVAL", "3")
+        )
 
         # MQTT v5 client
         self._mqtt_client: Optional[CloudNodeMQTTClient] = None
@@ -311,6 +321,7 @@ class CloudNode:
             self._log_flush_task = asyncio.create_task(self._log_flush_loop())
             self._mqtt_reconnect_task = asyncio.create_task(self._mqtt_reconnect_loop())
             self._workload_monitor_task = asyncio.create_task(self._workload_monitor_loop())
+            self._workload_log_stream_task = asyncio.create_task(self._workload_log_stream_loop())
 
             logger.info(
                 f"Cloud Node '{self.slug}' (uuid: {self.instance_uuid}) is running. "
@@ -520,116 +531,155 @@ class CloudNode:
         """Return whether a cancelled workload type should complete successfully."""
         return workload_type in self.CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES
 
+    async def _report_workload_startup_failure(
+        self, workload_uuid: Optional[str], error_msg: str
+    ) -> None:
+        """Mark an assigned workload as ``failed`` when it never got to run.
+
+        A start rejection — inference/training/simulate not configured, the host
+        already busy with another workload, or the spawn raising — leaves the
+        backend workload stuck in ``assigned`` with no ``running`` update. The
+        controller session then waits out the full deploy-timeout window and the
+        UI collapses the case into a generic "waiting for cloud node" message.
+
+        Publishing ``status=failed`` with an explicit ``failure_detail`` lets the
+        backend fail the session immediately with an actionable reason (e.g.
+        "controller host is busy") instead of a misleading deploy-timeout.
+
+        Best-effort: a missing ``workload_uuid`` or an MQTT error is logged and
+        swallowed so it can never mask the original rejection.
+        """
+        if not workload_uuid:
+            logger.debug("No workload_uuid on rejected workload; skipping startup-failure report")
+            return
+        if not self._mqtt_client:
+            logger.warning(
+                "MQTT client unavailable; cannot report startup failure for workload %s",
+                workload_uuid,
+            )
+            return
+        try:
+            await self._mqtt_client.update_workload_status(
+                workload_uuid=str(workload_uuid),
+                status="failed",
+                additional_data={
+                    # ``error`` is what the controller-session schema surfaces to
+                    # the UI (resolve_failure_detail); ``failure_detail`` mirrors
+                    # it into workload metadata for operator diagnostics.
+                    "error": error_msg,
+                    "failure_detail": error_msg,
+                },
+            )
+            logger.info("Reported startup failure for workload %s: %s", workload_uuid, error_msg)
+        except (MQTTError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "Failed to report startup failure for workload %s: %s",
+                workload_uuid,
+                exc,
+            )
+
     async def _handle_inference(self, params: dict, request_id: Optional[str]) -> None:
         """Handle an inference command by spawning a detached process."""
+        workload_uuid = params.get("workload_uuid")
         try:
             if not self.config.inference:
-                self._publish_response(
-                    request_id,
-                    success=False,
-                    error="Inference command not configured in cyberwave.yml",
-                )
+                error_msg = "Inference command not configured in cyberwave.yml"
+                self._publish_response(request_id, success=False, error=error_msg)
+                await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
-            # Check if node is busy (optional: could support multiple concurrent workloads)
             if self._is_node_busy():
+                error_msg = (
+                    f"Controller host is busy with {self._get_active_workload_count()} "
+                    f"active workload(s). Stop the existing controller before starting a new one."
+                )
                 logger.warning(
                     f"Node is busy with {self._get_active_workload_count()} active workload(s). "
                     f"Rejecting inference request {request_id}"
                 )
-                self._publish_response(
-                    request_id,
-                    success=False,
-                    error=f"Node is busy with {self._get_active_workload_count()} active workload(s)",
-                )
+                self._publish_response(request_id, success=False, error=error_msg)
+                await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
             logger.info(f"Starting inference workload (request_id: {request_id})")
             await self._spawn_workload_process("inference", params, request_id)
 
         except Exception as e:
+            error_msg = f"Failed to start inference: {str(e)}"
             logger.error(
                 f"Error starting inference command (request_id: {request_id}): {e}", exc_info=True
             )
-            self._publish_response(
-                request_id,
-                success=False,
-                error=f"Failed to start inference: {str(e)}",
-            )
+            self._publish_response(request_id, success=False, error=error_msg)
+            await self._report_workload_startup_failure(workload_uuid, error_msg)
 
     async def _handle_training(self, params: dict, request_id: Optional[str]) -> None:
         """Handle a training command by spawning a detached process."""
+        workload_uuid = params.get("workload_uuid")
         try:
             if not self.config.training:
-                self._publish_response(
-                    request_id,
-                    success=False,
-                    error="Training command not configured in cyberwave.yml",
-                )
+                error_msg = "Training command not configured in cyberwave.yml"
+                self._publish_response(request_id, success=False, error=error_msg)
+                await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
-            # Check if node is busy (optional: could support multiple concurrent workloads)
             if self._is_node_busy():
+                error_msg = (
+                    f"Controller host is busy with {self._get_active_workload_count()} "
+                    f"active workload(s). Stop the existing workload before starting a new one."
+                )
                 logger.warning(
                     f"Node is busy with {self._get_active_workload_count()} active workload(s). "
                     f"Rejecting training request {request_id}"
                 )
-                self._publish_response(
-                    request_id,
-                    success=False,
-                    error=f"Node is busy with {self._get_active_workload_count()} active workload(s)",  # noqa: E501
-                )
+                self._publish_response(request_id, success=False, error=error_msg)
+                await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
             logger.info(f"Starting training workload (request_id: {request_id})")
             await self._spawn_workload_process("training", params, request_id)
 
         except Exception as e:
+            error_msg = f"Failed to start training: {str(e)}"
             logger.error(
                 f"Error starting training command (request_id: {request_id}): {e}", exc_info=True
             )
-            self._publish_response(
-                request_id,
-                success=False,
-                error=f"Failed to start training: {str(e)}",
-            )
+            self._publish_response(request_id, success=False, error=error_msg)
+            await self._report_workload_startup_failure(workload_uuid, error_msg)
 
     async def _handle_simulate(self, params: dict, request_id: Optional[str]) -> None:
         """Handle a simulate command by spawning a detached process."""
+        workload_uuid = params.get("workload_uuid")
         try:
             if not self.config.simulate:
-                self._publish_response(
-                    request_id,
-                    success=False,
-                    error="Simulate command not configured in cyberwave.yml",
-                )
+                error_msg = "Simulate command not configured in cyberwave.yml"
+                self._publish_response(request_id, success=False, error=error_msg)
+                await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
             if self._is_node_busy():
+                error_msg = (
+                    f"Controller host is busy with {self._get_active_workload_count()} "
+                    f"active workload(s). Stop the existing workload before starting a new one."
+                )
                 logger.warning(
                     f"Node is busy with {self._get_active_workload_count()} active workload(s). "
                     f"Rejecting simulate request {request_id}"
                 )
-                self._publish_response(
-                    request_id,
-                    success=False,
-                    error=f"Node is busy with {self._get_active_workload_count()} active workload(s)",
-                )
+                self._publish_response(request_id, success=False, error=error_msg)
+                await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
             logger.info(f"Starting simulate workload (request_id: {request_id})")
             await self._spawn_workload_process("simulate", params, request_id)
 
         except Exception as e:
+            error_msg = f"Failed to start simulate: {str(e)}"
             logger.error(
                 f"Error starting simulate command (request_id: {request_id}): {e}",
                 exc_info=True,
             )
-            self._publish_response(
-                request_id,
-                success=False,
-                error=f"Failed to start simulate: {str(e)}",
-            )
+            self._publish_response(request_id, success=False, error=error_msg)
+            await self._report_workload_startup_failure(workload_uuid, error_msg)
 
     async def _handle_status(self, request_id: Optional[str]) -> None:
         """Handle a status query."""
@@ -1309,6 +1359,25 @@ class CloudNode:
 
                 # Check if process still exists
                 if self._is_process_alive(pid):
+                    # A live process from a previous session is only safe to
+                    # reattach if the backend still considers its workload
+                    # non-terminal and bound to this node. Otherwise it is a
+                    # stale orphan (e.g. an RL controller still driving a plant
+                    # whose session was already reaped as a deploy-timeout) that
+                    # keeps this node "busy" and rejects every new controller.
+                    stale_reason = self._classify_recovered_workload(data)
+                    if stale_reason is not None:
+                        logger.warning(
+                            "Killing stale orphan workload PID %s (%s): %s",
+                            pid,
+                            data.get("workload_type", "unknown"),
+                            stale_reason,
+                        )
+                        await self._kill_stale_process_group(pid)
+                        # Do NOT add to _active_workloads; the trailing
+                        # _save_workload_state() drops it from the state file.
+                        continue
+
                     # Reattach tracking
                     workload = ActiveWorkload(
                         pid=pid,
@@ -1334,9 +1403,107 @@ class CloudNode:
 
             logger.info(f"Recovered {len(self._active_workloads)} active workload(s)")
 
+            # Persist the reconciled state so killed orphans and completed
+            # workloads are no longer carried across the next restart.
+            await self._save_workload_state()
+
         except Exception as e:
             logger.error(f"Failed to recover workload state: {e}", exc_info=True)
             raise
+
+    # Backend statuses that mean a recovered process is no longer doing useful
+    # work and should be treated as a stale orphan.
+    _TERMINAL_BACKEND_WORKLOAD_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+    def _classify_recovered_workload(self, data: dict) -> Optional[str]:
+        """Decide whether a recovered *live* PID is a stale orphan to kill.
+
+        Returns a human-readable reason string when the backend authoritatively
+        says the workload is terminal, no longer exists, or is bound to a
+        *different* instance — meaning the live process is a leftover from a
+        previous session that must be terminated so this node frees up.
+
+        Returns ``None`` (reattach) when the workload is still valid for this
+        node, when there is no ``workload_uuid`` to check, or when the backend
+        cannot be reached — an inconclusive check must never kill a process, or
+        a transient network blip at startup would take down a healthy
+        controller.
+        """
+        workload_uuid = data.get("workload_uuid")
+        if not workload_uuid:
+            # Nothing to reconcile against; keep the current best-effort reattach.
+            return None
+
+        try:
+            backend = self.client.get_workload(str(workload_uuid))
+        except Exception as exc:
+            logger.warning(
+                "Could not verify recovered workload %s against the backend (%s); "
+                "reattaching to be safe.",
+                workload_uuid,
+                exc,
+            )
+            return None
+
+        if backend is None:
+            return f"workload {workload_uuid} no longer exists on the backend"
+
+        status = str(backend.get("status") or "").lower()
+        if status in self._TERMINAL_BACKEND_WORKLOAD_STATUSES:
+            return f"backend workload {workload_uuid} is terminal (status={status})"
+
+        backend_instance = backend.get("instance_uuid")
+        if (
+            self.instance_uuid
+            and backend_instance
+            and str(backend_instance) != str(self.instance_uuid)
+        ):
+            return (
+                f"backend workload {workload_uuid} is assigned to a different "
+                f"instance ({backend_instance}, not {self.instance_uuid})"
+            )
+
+        return None
+
+    async def _kill_stale_process_group(self, pid: int) -> None:
+        """Terminate a stale workload's whole process group (SIGTERM then SIGKILL).
+
+        Workloads are spawned with ``start_new_session=True`` so the tracked PID
+        is the process-group leader; signalling the group stops the wrapper
+        shell and the actual controller command. Best-effort: an already-gone
+        process is treated as success.
+        """
+        if not self._is_process_alive(pid):
+            return
+
+        def _signal_group(sig: "signal.Signals") -> None:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(pid, sig)
+                else:
+                    psutil.Process(pid).send_signal(sig)
+            except (ProcessLookupError, psutil.NoSuchProcess):
+                pass
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to send %s to stale process group %s: %s", sig, pid, exc)
+
+        _signal_group(signal.SIGTERM)
+        for _ in range(15):  # up to 3s
+            await asyncio.sleep(0.2)
+            if not self._is_process_alive(pid):
+                logger.info("Stale process group %s exited after SIGTERM", pid)
+                return
+
+        logger.warning(
+            "Stale process group %s survived SIGTERM after 3s; escalating to SIGKILL",
+            pid,
+        )
+        _signal_group(signal.SIGKILL)
+        for _ in range(10):  # up to 2s
+            await asyncio.sleep(0.2)
+            if not self._is_process_alive(pid):
+                return
+        logger.error("Stale process group %s still alive after SIGKILL", pid)
 
     async def _handle_orphaned_completion(self, data: dict) -> None:
         """Handle a workload that finished while the Cloud Node was restarting.
@@ -1603,13 +1770,23 @@ class CloudNode:
             if failure_stderr:
                 result_data["stderr"] = failure_stderr
 
-            if stdout_content:
-                # Send stdout via log streaming
-                await self._buffer_log(stdout_content, "stdout")
-
-            if stderr_content:
-                # Send stderr via log streaming
-                await self._buffer_log(stderr_content, "stderr")
+            # Send only the tail not already live-streamed during the run, so
+            # cancelled/short workloads still get their final output to the
+            # backend (this path runs on the cancel/SIGTERM completion too) while
+            # long runs don't re-send everything.
+            final_out, workload.stdout_offset = self._read_new_log_bytes(
+                workload.stdout_file, workload.stdout_offset
+            )
+            if final_out:
+                await self._buffer_log(final_out, "stdout")
+            final_err, workload.stderr_offset = self._read_new_log_bytes(
+                workload.stderr_file, workload.stderr_offset
+            )
+            if final_err:
+                await self._buffer_log(final_err, "stderr")
+            # Flush now so the final output lands even if the node stops before
+            # the next periodic flush.
+            await self._flush_logs()
 
             # Step 3a: Check for files to upload and handle upload process
             # Only upload on success, and only if upload_results is enabled
@@ -2222,13 +2399,84 @@ class CloudNode:
 
             await asyncio.sleep(self.config.heartbeat_interval)
 
+    def _read_new_log_bytes(self, path: Path, offset: int) -> tuple[str, int]:
+        """Read newly-appended text from ``path`` starting at byte ``offset``.
+
+        Returns the decoded new text and the updated byte offset. Never raises —
+        a missing/rotated file simply yields ``("", offset)`` so the caller keeps
+        its place. Decodes with ``errors="replace"`` to tolerate a read that
+        lands mid-multibyte-character.
+        """
+        try:
+            if not path.exists():
+                return "", offset
+            size = path.stat().st_size
+            if size <= offset:
+                # No new content (or the file was truncated/rotated — reset).
+                return "", (0 if size < offset else offset)
+            with open(path, "rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read()
+            return chunk.decode("utf-8", errors="replace"), offset + len(chunk)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"Failed to tail log file {path}: {e}")
+            return "", offset
+
+    async def _stream_active_workload_logs(self) -> None:
+        """Tail each active workload's stdout/stderr into the log buffer.
+
+        Streams only bytes past each workload's saved offset so nothing is sent
+        twice. Content is buffered and flushed via the shared ``send_log`` path
+        so the frontend logs panel populates during the run.
+        """
+        async with self._workload_lock:
+            workloads = list(self._active_workloads.values())
+
+        streamed_any = False
+        for workload in workloads:
+            new_out, workload.stdout_offset = self._read_new_log_bytes(
+                workload.stdout_file, workload.stdout_offset
+            )
+            if new_out:
+                await self._buffer_log(new_out, "stdout")
+                streamed_any = True
+            new_err, workload.stderr_offset = self._read_new_log_bytes(
+                workload.stderr_file, workload.stderr_offset
+            )
+            if new_err:
+                await self._buffer_log(new_err, "stderr")
+                streamed_any = True
+
+        if streamed_any:
+            # Flush immediately so the panel is near-live, independent of the
+            # slower general 30s flush loop.
+            await self._flush_logs()
+
+    async def _workload_log_stream_loop(self) -> None:
+        """Periodically live-stream active workloads' output to the backend."""
+        logger.info(
+            f"Starting workload log stream loop (interval: {self._workload_log_stream_interval}s)"
+        )
+        while self._running:
+            await asyncio.sleep(self._workload_log_stream_interval)
+            try:
+                await self._stream_active_workload_logs()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(f"Error streaming workload logs: {e}", exc_info=True)
+
     async def _log_flush_loop(self) -> None:
         """Periodically flush buffered logs to the backend."""
         logger.info(f"Starting log flush loop (interval: {self._log_flush_interval}s)")
 
         while self._running:
             await asyncio.sleep(self._log_flush_interval)
-            await self._flush_logs()
+            try:
+                await self._flush_logs()
+            except Exception as e:  # pragma: no cover - defensive
+                # A single unexpected error must never permanently kill log
+                # flushing (previously an error other than MQTTError/Timeout
+                # would propagate and stop all further log persistence).
+                logger.error(f"Error in log flush loop: {e}", exc_info=True)
 
     async def _mqtt_reconnect_loop(self) -> None:
         """Monitor MQTT connection while the Paho network loop auto-reconnects."""
@@ -2480,6 +2728,7 @@ class CloudNode:
             ("log_flush", self._log_flush_task),
             ("mqtt_reconnect", self._mqtt_reconnect_task),
             ("workload_monitor", self._workload_monitor_task),
+            ("workload_log_stream", self._workload_log_stream_task),
         ]
 
         for task_name, task in background_tasks:
