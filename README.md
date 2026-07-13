@@ -364,8 +364,18 @@ same `send_log` MQTT path (→ `NodeInstanceLog`). The completion/cancel handler
 sends only the remaining tail, so nothing is double-sent. This is what powers
 the frontend "Policy decision logs" panel for online RL inference.
 
+The same tailed content is **also mirrored to the node's own stdout/stderr**, so
+it shows up in `docker logs` for the container. Without this, `docker logs` only
+shows the supervisor's logs: the workload runs as a detached subprocess whose
+fds point at the log files above, never at the container stdout. Each mirrored
+line is tagged `[workload <id> <stdout|stderr>]` so it stays distinguishable
+from the supervisor's own `logging`-formatted lines, and stdout/stderr remain
+separated (the two files, and their MQTT streams, are untouched). Enable
+per-step inference detail with `CYBERWAVE_RL_DEBUG=1` (see `cyberwave-rl-task`).
+
 - `CYBERWAVE_WORKLOAD_LOG_STREAM_INTERVAL` (default `3`, seconds): cadence of the
-  live tail. Lower = more responsive panel, more MQTT traffic.
+  live tail — this also sets how quickly mirrored output reaches `docker logs`.
+  Lower = more responsive panel, more MQTT traffic.
 - The periodic log-flush loop is now crash-resistant: a single unexpected error
   no longer permanently stops log persistence (previously any exception other
   than `MQTTError`/`TimeoutError` killed the flush loop and silenced all further

@@ -284,5 +284,72 @@ class RecoverLocalWorkloadsHygieneTests(unittest.TestCase):
             self.assertIn(424247, node._active_workloads)
 
 
+class ConsoleMirrorTests(unittest.TestCase):
+    """Workload output is mirrored to the node console with a source prefix.
+
+    The workload runs as a detached subprocess whose fds point at log files, so
+    ``docker logs`` only shows the supervisor. Mirroring surfaces the workload
+    output there too, tagged per line so it stays distinguishable, while the
+    per-file stdout/stderr separation is preserved.
+    """
+
+    def _mirror(self, node, workload, text, log_type, **kwargs):
+        from io import StringIO
+
+        target = "stderr" if log_type == "stderr" else "stdout"
+        buf = StringIO()
+        with patch(f"cyberwave_cloud_node.cloud_node.sys.{target}", buf):
+            node._mirror_workload_output(workload, text, log_type, **kwargs)
+        return buf.getvalue()
+
+    def test_complete_lines_are_prefixed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node = _make_node(tmp_dir)
+            wl = _dummy_active_workload(1, tmp_dir)
+            wl.workload_uuid = "wl-abc"
+            out = self._mirror(node, wl, "[rltask] step 1\n[rltask] step 2\n", "stdout")
+        self.assertEqual(
+            out,
+            "[workload wl-abc stdout] [rltask] step 1\n"
+            "[workload wl-abc stdout] [rltask] step 2\n",
+        )
+
+    def test_partial_line_is_held_then_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node = _make_node(tmp_dir)
+            wl = _dummy_active_workload(1, tmp_dir)
+            wl.workload_uuid = "wl-abc"
+            # A tail read lands mid-line: only the completed line is emitted now.
+            first = self._mirror(node, wl, "done line\npartial", "stdout")
+            self.assertEqual(first, "[workload wl-abc stdout] done line\n")
+            # The rest of the line arrives next tick and is emitted whole.
+            second = self._mirror(node, wl, " rest\n", "stdout")
+            self.assertEqual(second, "[workload wl-abc stdout] partial rest\n")
+
+    def test_flush_partial_emits_unterminated_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node = _make_node(tmp_dir)
+            wl = _dummy_active_workload(1, tmp_dir)
+            wl.workload_uuid = "wl-abc"
+            # Crash output with no trailing newline must still reach the console.
+            out = self._mirror(
+                node, wl, "Traceback (most recent call last):", "stderr", flush_partial=True
+            )
+        self.assertEqual(
+            out, "[workload wl-abc stderr] Traceback (most recent call last):\n"
+        )
+
+    def test_stdout_and_stderr_use_separate_residuals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node = _make_node(tmp_dir)
+            wl = _dummy_active_workload(1, tmp_dir)
+            wl.workload_uuid = "wl-abc"
+            self._mirror(node, wl, "out-partial", "stdout")
+            self._mirror(node, wl, "err-partial", "stderr")
+            # Residuals must not bleed across streams.
+            self.assertEqual(wl.stdout_residual, "out-partial")
+            self.assertEqual(wl.stderr_residual, "err-partial")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -146,6 +147,11 @@ class ActiveWorkload:
     # the completion handler never re-send the same bytes (backend appends).
     stdout_offset: int = 0
     stderr_offset: int = 0
+    # Trailing partial line held back when mirroring to the node console, so each
+    # emitted line gets its source prefix intact (the periodic tail read can land
+    # mid-line). Flushed on workload completion.
+    stdout_residual: str = ""
+    stderr_residual: str = ""
 
 
 class CloudNode:
@@ -1880,11 +1886,13 @@ class CloudNode:
             final_out, workload.stdout_offset = self._read_new_log_bytes(
                 workload.stdout_file, workload.stdout_offset
             )
+            self._mirror_workload_output(workload, final_out, "stdout", flush_partial=True)
             if final_out:
                 await self._buffer_log(final_out, "stdout")
             final_err, workload.stderr_offset = self._read_new_log_bytes(
                 workload.stderr_file, workload.stderr_offset
             )
+            self._mirror_workload_output(workload, final_err, "stderr", flush_partial=True)
             if final_err:
                 await self._buffer_log(final_err, "stderr")
             # Flush now so the final output lands even if the node stops before
@@ -2525,6 +2533,56 @@ class CloudNode:
             logger.debug(f"Failed to tail log file {path}: {e}")
             return "", offset
 
+    def _mirror_workload_output(
+        self,
+        workload: "ActiveWorkload",
+        text: str,
+        log_type: str,
+        *,
+        flush_partial: bool = False,
+    ) -> None:
+        """Echo streamed workload output to the node's own stdout/stderr.
+
+        The workload runs as a detached subprocess whose fds point at the
+        per-workload log files, so its output never reaches the container's
+        stdout and ``docker logs`` only shows the supervisor's logs. Mirroring
+        here — from the same per-file read used for MQTT streaming — surfaces
+        the workload output in ``docker logs`` while keeping stdout and stderr
+        separated (the two files, and their MQTT streams, are untouched).
+
+        Each line is tagged with a ``[workload <id> <stream>]`` prefix so it is
+        distinguishable from the supervisor's own ``logging``-formatted lines.
+        A tail read can land mid-line, so the trailing partial line is buffered
+        on the workload until the next newline; pass ``flush_partial=True`` on
+        completion to emit whatever remains.
+        """
+        residual_attr = "stderr_residual" if log_type == "stderr" else "stdout_residual"
+        buffered = getattr(workload, residual_attr) + text
+        lines = buffered.split("\n")
+        if flush_partial:
+            # Nothing more will arrive; drop only a trailing empty segment so we
+            # don't emit a blank prefixed line for the final newline.
+            if lines and lines[-1] == "":
+                lines.pop()
+            setattr(workload, residual_attr, "")
+        else:
+            # Last segment is the text after the final newline (possibly ""):
+            # hold it back until the rest of the line arrives.
+            setattr(workload, residual_attr, lines.pop())
+        if not lines:
+            return
+        tag = workload.workload_uuid or workload.request_id or workload.workload_type
+        prefix = f"[workload {tag} {log_type}] "
+        target = sys.stderr if log_type == "stderr" else sys.stdout
+        # One write + one flush for the whole tick's worth of lines, rather than
+        # a syscall per line (a debug-mode burst can be thousands of lines).
+        payload = "".join(f"{prefix}{line}\n" for line in lines)
+        try:
+            target.write(payload)
+            target.flush()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"Failed to mirror workload {log_type} to console: {e}")
+
     async def _stream_active_workload_logs(self) -> None:
         """Tail each active workload's stdout/stderr into the log buffer.
 
@@ -2541,12 +2599,14 @@ class CloudNode:
                 workload.stdout_file, workload.stdout_offset
             )
             if new_out:
+                self._mirror_workload_output(workload, new_out, "stdout")
                 await self._buffer_log(new_out, "stdout")
                 streamed_any = True
             new_err, workload.stderr_offset = self._read_new_log_bytes(
                 workload.stderr_file, workload.stderr_offset
             )
             if new_err:
+                self._mirror_workload_output(workload, new_err, "stderr")
                 await self._buffer_log(new_err, "stderr")
                 streamed_any = True
 
