@@ -23,9 +23,10 @@ import signal
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, Optional
 
 import httpx
 import psutil
@@ -52,7 +53,9 @@ from .mqtt import (
 logger = logging.getLogger(__name__)
 
 # Platform-internal keys stripped before calling user module functions
-_PLATFORM_PARAMS = frozenset({"workload_uuid", "command_type", "status"})
+_PLATFORM_PARAMS = frozenset(
+    {"workload_uuid", "command_type", "status", "cyberwave_workload_token"}
+)
 
 # Mapping from workload type to the user-facing function name in module dispatch
 _WORKLOAD_FN_MAP: dict[str, str] = {
@@ -60,6 +63,45 @@ _WORKLOAD_FN_MAP: dict[str, str] = {
     "training": "train",
     "simulate": "simulate",
 }
+
+# Env vars that carry the node's API credential. CYBERWAVE_MQTT_PASSWORD takes
+# priority over CYBERWAVE_API_KEY for the broker (see config.get_mqtt_password),
+# so both must be overridden to fully swap the credential a worker sees.
+_API_CREDENTIAL_ENV_VARS = ("CYBERWAVE_API_KEY", "CYBERWAVE_MQTT_PASSWORD")
+
+
+@contextmanager
+def _scoped_api_credential(token: str) -> Iterator[None]:
+    """Temporarily expose ``token`` as the process API credential.
+
+    Sets BOTH ``CYBERWAVE_API_KEY`` and ``CYBERWAVE_MQTT_PASSWORD`` to the scoped
+    workload token so the REST and MQTT clients that in-process worker code
+    constructs authenticate with the workload token instead of the node's service
+    token. Setting the broker password explicitly (rather than dropping it and
+    relying on the ``CYBERWAVE_MQTT_PASSWORD -> CYBERWAVE_API_KEY`` fallback in
+    ``config.get_mqtt_password``) keeps workers that read the broker password
+    directly working. The token is minted to double as the broker password, so
+    both reads resolve to the same valid credential. Restores the previous
+    environment on exit.
+
+    NOT thread-safe on its own — ``os.environ`` is process-global, so callers
+    must serialise (module dispatch holds ``_module_dispatch_lock``). In-process
+    dispatch is also not a memory-isolation boundary: worker code can still read
+    whatever else lives in the environment. The subprocess path remains the true
+    isolation boundary; this simply ensures module-dispatch workers use the
+    scoped, auto-revoked credential for their platform calls.
+    """
+    saved = {name: os.environ.get(name) for name in _API_CREDENTIAL_ENV_VARS}
+    for name in _API_CREDENTIAL_ENV_VARS:
+        os.environ[name] = token
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 # Forward-reference type for the optional manifest schema
 try:
@@ -174,6 +216,9 @@ class CloudNode:
         # Track active workloads by PID (process-based, survives restarts)
         self._active_workloads: Dict[int, ActiveWorkload] = {}
         self._workload_lock = asyncio.Lock()
+        # Serialises module-dispatch execution while the per-workload token is
+        # swapped into the process environment (os.environ is process-global).
+        self._module_dispatch_lock = asyncio.Lock()
 
         # Directory for workload output files
         self._workload_output_dir = Path.home() / ".cyberwave" / "workload_logs"
@@ -1043,6 +1088,14 @@ class CloudNode:
         stdout_file = self._workload_output_dir / f"{workload_id}.stdout.log"
         stderr_file = self._workload_output_dir / f"{workload_id}.stderr.log"
 
+        # Pull the per-workload token (minted by the backend at dispatch) out of
+        # params BEFORE anything persists them, so the short-lived credential is
+        # never written to the params file, the tracked ActiveWorkload, or the
+        # on-disk active_workloads.json. It is injected into the worker's
+        # environment (as CYBERWAVE_API_KEY) further below instead of the node's
+        # own service token.
+        workload_token = params.pop("cyberwave_workload_token", None)
+
         # Process image_bytes_base64 if present: decode and save as file
         # This avoids "Argument list too long" errors and makes params cleaner
         if "image_bytes_base64" in params and params["image_bytes_base64"]:
@@ -1121,10 +1174,28 @@ class CloudNode:
                     subprocess_env[var] = os.environ[var]
                     logger.debug(f"Passing {var} to subprocess")
 
-            api_token = get_api_token()
+            # Prefer the per-workload scoped token so the worker never runs with
+            # the node's long-lived service token. Fall back to the service token
+            # only when the backend didn't mint one (older backend, or no
+            # resolvable owner) so existing deployments keep working.
+            api_token = workload_token or get_api_token()
             if api_token:
                 subprocess_env["CYBERWAVE_API_KEY"] = api_token
-                logger.debug("Passing CYBERWAVE_API_KEY to subprocess")
+                if workload_token:
+                    # clean_subprocess_env() copies the whole environment, so the
+                    # node's CYBERWAVE_MQTT_PASSWORD (which wins over
+                    # CYBERWAVE_API_KEY for the broker) would otherwise leak in.
+                    # Overwrite it with the scoped token — rather than dropping it
+                    # and relying on the fallback — so workers that read the broker
+                    # password directly stay compatible. The token doubles as the
+                    # broker password, so both reads resolve to the same credential.
+                    subprocess_env["CYBERWAVE_MQTT_PASSWORD"] = workload_token
+                    logger.info(
+                        "Passing per-workload scoped token to subprocess "
+                        "(service token withheld from workload)"
+                    )
+                else:
+                    logger.debug("Passing service CYBERWAVE_API_KEY to subprocess")
 
             with stdout_file.open("w") as stdout_f, stderr_file.open("w") as stderr_f:
                 process = subprocess.Popen(
@@ -1263,12 +1334,21 @@ class CloudNode:
             except Exception as e:
                 logger.warning("Failed to send running status for module workload: %s", e)
 
+        # The per-workload token (minted by the backend at dispatch) is also a
+        # platform param, so it's stripped from user_params below. Unlike the
+        # subprocess path, module dispatch runs the worker in THIS process, so we
+        # expose the scoped token as the process credential for the duration of
+        # the call (see _scoped_api_credential / _run_module_fn) — the worker's
+        # SDK clients then authenticate with the short-lived, workload-scoped
+        # token instead of the node's service token.
+        workload_token = params.get("cyberwave_workload_token")
+
         # Strip platform-internal keys before calling user function
         user_params = {k: v for k, v in params.items() if k not in _PLATFORM_PARAMS}
 
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(None, lambda: fn(**user_params))
+            result = await self._run_module_fn(loop, fn, user_params, workload_token)
             output = json.dumps(result) if not isinstance(result, str) else result
             self._publish_response(request_id, success=True, output=output)
             if workload_uuid and self._mqtt_client:
@@ -1282,6 +1362,29 @@ class CloudNode:
                 await self._mqtt_client.complete_workload(
                     workload_uuid=workload_uuid, success=False, exit_code=1, timeout=30.0
                 )
+
+    async def _run_module_fn(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        fn: Any,
+        user_params: dict,
+        workload_token: Optional[str],
+    ) -> Any:
+        """Run a module-dispatch worker fn, scoping the API credential if minted.
+
+        With a per-workload token, the call is serialised behind
+        ``_module_dispatch_lock`` while the token is swapped into the process
+        environment (``os.environ`` is process-global), so the worker's SDK
+        clients pick up the scoped credential. Without one (older backend, no
+        resolvable owner) it falls back to today's behaviour: the worker inherits
+        the node's ambient credential.
+        """
+        if not workload_token:
+            return await loop.run_in_executor(None, lambda: fn(**user_params))
+
+        async with self._module_dispatch_lock:
+            with _scoped_api_credential(workload_token):
+                return await loop.run_in_executor(None, lambda: fn(**user_params))
 
     async def _load_manifest_workers(self) -> None:
         """Load worker modules declared in the manifest's ``workers:`` list."""
