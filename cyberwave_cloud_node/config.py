@@ -123,6 +123,18 @@ def get_environment() -> Optional[str]:
     return None
 
 
+def get_reserved_environment_uuid() -> Optional[str]:
+    """Get the environment UUID this node is reserved for, if any.
+
+    When set (via CYBERWAVE_NODE_ENVIRONMENT_UUID), the node registers itself
+    as reserved for that Cyberwave environment: the backend will only schedule
+    that environment's workloads on this node. Not to be confused with
+    CYBERWAVE_ENVIRONMENT, which selects the deployment target (dev/prod).
+    """
+    value = os.getenv("CYBERWAVE_NODE_ENVIRONMENT_UUID")
+    return value or None
+
+
 def get_instance_uuid() -> Optional[str]:
     """Get the instance UUID from environment or stored identity.
 
@@ -275,6 +287,9 @@ class CloudNodeConfig:
     training: Optional[str] = None
     simulate: Optional[str] = None
     profile_slug: str = "default"
+    # Cyberwave environment UUID this node is reserved for (optional). When
+    # set, the backend only schedules that environment's workloads here.
+    reserved_environment_uuid: Optional[str] = None
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
     mqtt_host: str = DEFAULT_MQTT_HOST
     mqtt_port: int = DEFAULT_MQTT_PORT
@@ -299,6 +314,9 @@ class CloudNodeConfig:
             training=cloud_node_data.get("training"),
             simulate=cloud_node_data.get("simulate"),
             profile_slug=cloud_node_data.get("profile_slug", "default"),
+            reserved_environment_uuid=cloud_node_data.get(
+                "environment_uuid", get_reserved_environment_uuid()
+            ),
             heartbeat_interval=cloud_node_data.get(
                 "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL
             ),
@@ -320,6 +338,7 @@ class CloudNodeConfig:
                     "training",
                     "simulate",
                     "profile_slug",
+                    "environment_uuid",
                     "heartbeat_interval",
                     "mqtt_host",
                     "mqtt_port",
@@ -379,6 +398,7 @@ class CloudNodeConfig:
             training=os.getenv("CYBERWAVE_TRAINING_CMD"),
             simulate=os.getenv("CYBERWAVE_SIMULATE_CMD"),
             profile_slug=os.getenv("CYBERWAVE_PROFILE_SLUG", "default"),
+            reserved_environment_uuid=get_reserved_environment_uuid(),
             heartbeat_interval=int(
                 os.getenv("CYBERWAVE_HEARTBEAT_INTERVAL", str(DEFAULT_HEARTBEAT_INTERVAL))
             ),

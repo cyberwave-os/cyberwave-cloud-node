@@ -163,6 +163,7 @@ class StartNodeTests(unittest.TestCase):
         return SimpleNamespace(
             config=None,
             profile=None,
+            environment_uuid=None,
             mqtt_host=None,
             mqtt_port=None,
             slug=None,
@@ -172,6 +173,7 @@ class StartNodeTests(unittest.TestCase):
     def _config() -> SimpleNamespace:
         return SimpleNamespace(
             profile_slug="cyberwave-sim",
+            reserved_environment_uuid=None,
             mqtt_host="localhost",
             mqtt_port=1883,
             inference=None,

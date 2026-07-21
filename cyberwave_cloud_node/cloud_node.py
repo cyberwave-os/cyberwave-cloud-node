@@ -2329,6 +2329,7 @@ class CloudNode:
                         slug=self.slug or None,  # Optional hint, backend assigns actual slug
                         provider="self-hosted",
                         visibility="private",
+                        environment_uuid=self.config.reserved_environment_uuid,
                         timeout=30.0,
                     )
 
@@ -2355,6 +2356,7 @@ class CloudNode:
                 register_response = await self._mqtt_client.register_instance(
                     instance_uuid=instance_uuid,
                     profile_slug=self.config.profile_slug,
+                    environment_uuid=self.config.reserved_environment_uuid,
                     timeout=30.0,
                 )
 

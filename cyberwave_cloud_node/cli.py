@@ -152,6 +152,16 @@ def main() -> int:
         help="Node profile slug (overrides config file)",
     )
     start_parser.add_argument(
+        "--environment",
+        default=None,
+        dest="environment_uuid",
+        help=(
+            "Environment UUID to reserve this node for: only that environment's "
+            "workloads will be scheduled here (overrides config file and "
+            "CYBERWAVE_NODE_ENVIRONMENT_UUID)"
+        ),
+    )
+    start_parser.add_argument(
         "--mqtt-host",
         default=None,
         dest="mqtt_host",
@@ -245,6 +255,8 @@ def start_node(args: argparse.Namespace) -> int:
         # Apply CLI overrides
         if args.profile:
             config.profile_slug = args.profile
+        if args.environment_uuid:
+            config.reserved_environment_uuid = args.environment_uuid
         if args.mqtt_host:
             config.mqtt_host = args.mqtt_host
         if args.mqtt_port:
@@ -256,6 +268,8 @@ def start_node(args: argparse.Namespace) -> int:
         if slug:
             logger.info(f"Starting Cloud Node with slug hint '{slug}'")
         logger.info(f"Profile: {config.profile_slug}")
+        if config.reserved_environment_uuid:
+            logger.info(f"Reserved for environment: {config.reserved_environment_uuid}")
         logger.info(f"Instance UUID: {get_instance_uuid()}")
         logger.info(f"MQTT Broker: {config.mqtt_host}:{config.mqtt_port}")
         if config.inference:

@@ -23,6 +23,7 @@ from .config import (
     get_api_token,
     get_api_url,
     get_instance_uuid,
+    get_reserved_environment_uuid,
     get_workspace_slug,
 )
 from .credentials import (
@@ -227,6 +228,7 @@ class CloudNodeClient:
         profile_slug: str,
         slug: Optional[str] = None,
         workspace_slug: Optional[str] = None,
+        environment_uuid: Optional[str] = None,
     ) -> RegisterResponse:
         """Create a new Cloud Node instance with the backend.
 
@@ -241,6 +243,8 @@ class CloudNodeClient:
             profile_slug: The node profile slug (defines capabilities)
             slug: Optional slug for this instance (backend generates if not provided)
             workspace_slug: Optional workspace slug override (passed as query param)
+            environment_uuid: Optional environment UUID to reserve this instance
+                for (only that environment's workloads will be scheduled here)
 
         Returns:
             RegisterResponse with success status, message, uuid and slug
@@ -253,6 +257,8 @@ class CloudNodeClient:
         }
         if slug:
             payload["slug"] = slug
+        if environment_uuid:
+            payload["environment_uuid"] = environment_uuid
 
         # Note: create_instance requires workspace_uuid in payload, but we have workspace_slug
         # The backend's require_workspace decorator can resolve workspace from query params
@@ -296,6 +302,7 @@ class CloudNodeClient:
         slug: Optional[str] = None,
         workspace_slug: Optional[str] = None,
         save_identity: bool = True,
+        environment_uuid: Optional[str] = None,
     ) -> RegisterResponse:
         """Register this Cloud Node instance with the backend.
 
@@ -314,6 +321,8 @@ class CloudNodeClient:
             slug: Optional slug for this instance (backend generates if not provided)
             workspace_slug: Optional workspace slug override
             save_identity: Whether to save the returned UUID/slug locally (default: True)
+            environment_uuid: Optional environment UUID to reserve this instance
+                for (defaults to CYBERWAVE_NODE_ENVIRONMENT_UUID when unset)
 
         Returns:
             RegisterResponse with success status, message, uuid and slug
@@ -339,6 +348,8 @@ class CloudNodeClient:
                 logger.info(f"Using stored identity: uuid={instance_uuid}, slug={slug}")
 
         ws_slug = workspace_slug or self.workspace_slug
+        if environment_uuid is None:
+            environment_uuid = get_reserved_environment_uuid()
 
         # If UUID exists, try to register directly first
         if instance_uuid:
@@ -346,6 +357,8 @@ class CloudNodeClient:
             payload = {
                 "profile_slug": profile_slug,
             }
+            if environment_uuid:
+                payload["environment_uuid"] = environment_uuid
 
             try:
                 # Use UUID-based endpoint: /api/v1/cloud-node/{uuid}/register
@@ -390,6 +403,7 @@ class CloudNodeClient:
                 profile_slug=profile_slug,
                 slug=slug,
                 workspace_slug=ws_slug,
+                environment_uuid=environment_uuid,
             )
             instance_uuid = create_result.uuid
             logger.info(f"Created instance with UUID: {instance_uuid}")
@@ -398,6 +412,8 @@ class CloudNodeClient:
             payload = {
                 "profile_slug": profile_slug,
             }
+            if environment_uuid:
+                payload["environment_uuid"] = environment_uuid
 
             endpoint = CLOUD_NODE_REGISTER_ENDPOINT.format(uuid=instance_uuid)
             response = self._client.post(endpoint, json=payload)

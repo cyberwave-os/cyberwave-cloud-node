@@ -107,6 +107,11 @@ On `start`, the node validates the token against the backend before connecting t
 - `CYBERWAVE_TRAINING_CMD`: Training command template
 - `CYBERWAVE_PROFILE_SLUG`: Node profile slug (default: "default")
 - `CYBERWAVE_HEARTBEAT_INTERVAL`: Heartbeat interval in seconds (default: 30)
+- `CYBERWAVE_NODE_ENVIRONMENT_UUID`: Reserve this node for a single Cyberwave
+  environment. Only that environment's workloads are scheduled on the node;
+  workloads from other environments (or with no environment) skip it. Can also
+  be set via `environment_uuid` in `cyberwave.yml` or the `--environment` CLI
+  flag (CLI flag > config file > env var).
 
 
 ## CLI Usage
@@ -124,6 +129,9 @@ cyberwave-cloud-node start --config ./path/to/cyberwave.yml
 
 # With profile override
 cyberwave-cloud-node start --profile gpu-a100
+
+# Reserved for a single environment (only that environment's workloads run here)
+cyberwave-cloud-node start --environment 11111111-2222-3333-4444-555555555555
 
 # With custom MQTT broker (local dev, no TLS)
 cyberwave-cloud-node start --mqtt-host localhost --mqtt-port 1883

@@ -508,6 +508,7 @@ class CloudNodeMQTTClient:
         workspace_uuid: Optional[str] = None,
         provider: str = "self-hosted",
         visibility: str = "private",
+        environment_uuid: Optional[str] = None,
         timeout: float = 30.0,
     ) -> MQTTResponse:
         """Request a cloud node instance creation via MQTT.
@@ -520,6 +521,8 @@ class CloudNodeMQTTClient:
             workspace_uuid: Optional workspace UUID
             provider: Provider type (default: self-hosted)
             visibility: Visibility setting (default: private)
+            environment_uuid: Optional environment UUID to reserve this
+                instance for (only that environment's workloads will run here)
             timeout: Timeout in seconds
 
         Returns:
@@ -545,6 +548,8 @@ class CloudNodeMQTTClient:
             payload["slug"] = slug
         if workspace_uuid:
             payload["workspace_uuid"] = workspace_uuid
+        if environment_uuid:
+            payload["environment_uuid"] = environment_uuid
 
         # Publish request to token topic
         topic = f"{self.topic_prefix}cyberwave/cloud-node-token/{token}/request-instance"
@@ -568,6 +573,7 @@ class CloudNodeMQTTClient:
         self,
         instance_uuid: str,
         profile_slug: str,
+        environment_uuid: Optional[str] = None,
         timeout: float = 30.0,
     ) -> MQTTResponse:
         """Register a cloud node instance after creation via MQTT.
@@ -579,6 +585,8 @@ class CloudNodeMQTTClient:
         Args:
             instance_uuid: UUID of the instance to register (from request_instance)
             profile_slug: Profile slug for the instance
+            environment_uuid: Optional environment UUID to reserve this
+                instance for (only that environment's workloads will run here)
             timeout: Timeout in seconds
 
         Returns:
@@ -592,6 +600,8 @@ class CloudNodeMQTTClient:
         payload = {
             "profile_slug": profile_slug,
         }
+        if environment_uuid:
+            payload["environment_uuid"] = environment_uuid
 
         # Publish request to cloud-node register topic
         topic = f"{self.topic_prefix}cyberwave/cloud-node/{instance_uuid}/register"
