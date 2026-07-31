@@ -221,7 +221,25 @@ class CloudNode:
 
         # Track active workloads by PID (process-based, survives restarts)
         self._active_workloads: Dict[int, ActiveWorkload] = {}
+        # Workloads whose process has exited but whose completion is still
+        # running: collecting output and, above all, uploading result files.
+        # Large artifacts keep this phase alive for many minutes, and it owns
+        # the host's disk and uplink just as much as the process did — so the
+        # node must keep counting itself busy until it is done. Tracked
+        # separately from _active_workloads because there is no live PID to
+        # monitor or kill any more.
+        self._finalizing_workloads: Dict[int, ActiveWorkload] = {}
         self._workload_lock = asyncio.Lock()
+        # Serialises the busy check with the spawn that follows it. The check is
+        # no longer instantaneous (it reconciles against the backend first), so
+        # without this two concurrent start commands — MQTT is at-least-once, and
+        # each command is handled in its own task — could both observe an idle
+        # node and both spawn.
+        self._start_lock = asyncio.Lock()
+        # Serialises stale-workload reconciliation so the heartbeat loop and an
+        # incoming start command don't verify (and race to kill) the same
+        # workloads at the same time.
+        self._reconcile_lock = asyncio.Lock()
         # Serialises module-dispatch execution while the per-workload token is
         # swapped into the process environment (os.environ is process-global).
         self._module_dispatch_lock = asyncio.Lock()
@@ -571,19 +589,224 @@ class CloudNode:
         self._publish_message("response", response)
 
     def _is_node_busy(self) -> bool:
-        """Check if the node is currently running any workloads."""
-        return len(self._active_workloads) > 0
+        """Check if the node is currently occupied by any workload.
+
+        Counts workloads that are still finalizing (uploading results) as well
+        as running ones: the process is gone but the upload still owns the
+        host's disk and uplink, and starting a second workload on top of a
+        multi-GB upload starves both.
+        """
+        return bool(self._active_workloads) or bool(self._finalizing_workloads)
+
+    def _busy_state_summary(self) -> str:
+        """Human-readable reason the node considers itself busy."""
+        running = len(self._active_workloads)
+        finalizing = len(self._finalizing_workloads)
+        parts = []
+        if running:
+            parts.append(f"{running} active workload(s)")
+        if finalizing:
+            parts.append(f"{finalizing} workload(s) uploading results")
+        return " and ".join(parts) or "no workloads"
+
+    async def _is_node_busy_after_self_heal(self) -> bool:
+        """Busy check that first drops workloads the backend says are stale.
+
+        A tracked workload can be a leftover the backend already terminalized
+        out-of-band (a force-stopped controller, a reaped session, an escalated
+        SIGKILL that never landed). Rejecting new work because of such a ghost
+        keeps the node "busy" forever while the backend keeps scheduling onto
+        it. Self-heal first, then answer with what actually remains.
+
+        Finalizing workloads are never reconciled away: their process is
+        already gone and the upload in flight is legitimate work, so they keep
+        the node busy until the completion handler releases them.
+        """
+        if not self._is_node_busy():
+            return False
+        if self._active_workloads:
+            # Time-boxed exactly like the heartbeat's pass: this runs while
+            # holding ``_start_lock``, and each ghost can cost a 30 s backend
+            # call plus a 5 s kill. Unbounded, a start command queues behind the
+            # lock for tens of seconds and the dispatch waiting on it is treated
+            # as lost. Whatever this pass does not finish is retried on the next
+            # heartbeat, and an unfinished kill releases its claim.
+            budget = self._self_heal_budget_seconds()
+            try:
+                await asyncio.wait_for(
+                    self._reconcile_stale_workloads(budget=budget),
+                    timeout=budget,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Stale-workload self-heal before busy check did not finish "
+                    "in %.1fs; answering with the current state.",
+                    budget,
+                )
+            except Exception as exc:
+                # A cleanup hiccup must degrade to the plain busy answer, not
+                # fail the incoming workload with an unrelated error.
+                logger.warning(
+                    "Stale-workload self-heal before busy check failed: %s", exc
+                )
+        return self._is_node_busy()
+
+    def _self_heal_budget_seconds(self) -> float:
+        """Wall-clock budget for one stale-workload self-heal pass.
+
+        A pass makes a synchronous backend call per workload (30 s client
+        timeout) and can wait up to 5 s on a kill, so it must be bounded
+        wherever it runs: unbounded, it either delays the heartbeat past the
+        backend's stale window (and the instance gets reaped — the very thing
+        the heartbeat prevents) or holds ``_start_lock`` long enough that the
+        dispatch waiting on it is treated as lost. Half a heartbeat interval,
+        never less than the 5 s a single kill can take.
+        """
+        return max(5.0, self.config.heartbeat_interval / 2)
+
+    async def _reconcile_stale_workloads(self, budget: Optional[float] = None) -> int:
+        """Kill tracked workloads the backend authoritatively considers stale.
+
+        Verifies every active workload against the backend (same criteria as
+        the startup recovery path: terminal status, deleted workload, or bound
+        to a different instance) and terminates the stale ones so the node
+        frees itself without waiting for a restart. Runs before the node
+        reports state (heartbeat) or rejects new work for being busy, so what
+        the node tells the backend always reflects post-cleanup reality.
+
+        Inconclusive checks (backend unreachable, no workload_uuid) keep the
+        workload — a network blip must never kill a healthy process. A process
+        that survives SIGKILL stays tracked so the busy state stays truthful.
+        Finalizing workloads are out of scope entirely: they have no live
+        process, and their result upload is legitimate in-flight work.
+
+        Serialised on ``_reconcile_lock`` so the heartbeat loop and an incoming
+        start command never verify the same workloads twice in parallel.
+
+        ``budget`` bounds the whole pass (including waiting for that lock) in
+        seconds: once it is spent the loop stops picking up new candidates and
+        leaves the rest for the next pass, so a node with several ghosts cannot
+        stall its caller. It does not interrupt a candidate already in progress —
+        callers that need a hard ceiling keep their own ``wait_for``, which is
+        safe because the kill below rolls its claim back on cancellation.
+
+        Returns the number of workloads freed.
+        """
+        deadline = (
+            asyncio.get_running_loop().time() + budget if budget is not None else None
+        )
+        async with self._reconcile_lock:
+            return await self._reconcile_stale_workloads_locked(deadline=deadline)
+
+    async def _reconcile_stale_workloads_locked(
+        self, deadline: Optional[float] = None
+    ) -> int:
+        """Body of :meth:`_reconcile_stale_workloads`; assumes the lock is held."""
+        async with self._workload_lock:
+            candidates = list(self._active_workloads.values())
+        if not candidates:
+            return 0
+
+        freed = 0
+        for index, workload in enumerate(candidates):
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                logger.warning(
+                    "Self-heal budget spent after examining %d of %d workload(s); "
+                    "the rest are retried on the next pass.",
+                    index,
+                    len(candidates),
+                )
+                break
+            try:
+                # The backend client is synchronous; keep the event loop free.
+                stale_reason = await asyncio.to_thread(
+                    self._classify_stale_workload, workload.workload_uuid
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Stale check for workload %s (PID %s) failed: %s; keeping it.",
+                    workload.workload_uuid,
+                    workload.pid,
+                    exc,
+                )
+                continue
+            if stale_reason is None:
+                continue
+
+            logger.warning(
+                "Killing stale workload PID %s (%s): %s",
+                workload.pid,
+                workload.workload_type,
+                stale_reason,
+            )
+            # Claim the completion BEFORE killing. The monitor loop polls
+            # liveness every few seconds; if it observed the killed process
+            # first it would claim the completion and report a status for a
+            # workload the backend already terminalized (flipping e.g.
+            # CANCELLED to FAILED and re-running the terminal side effects).
+            # The workload stays in ``_active_workloads`` until the kill is
+            # confirmed, so the node keeps reporting itself busy while the
+            # process is still dying.
+            async with self._workload_lock:
+                if workload.completion_started:
+                    # The monitor loop already owns this one — it exited on its
+                    # own just now. Let the normal completion flow finish it.
+                    continue
+                workload.completion_started = True
+
+            kill_finished = False
+            try:
+                await self._kill_stale_process_group(workload.pid)
+                kill_finished = True
+            finally:
+                if not kill_finished:
+                    # Interrupted mid-kill: the caller time-boxes this pass with
+                    # wait_for, and shutdown cancels the task outright. The claim
+                    # MUST come back off, or this workload can never complete:
+                    # _claim_workload_completion returns False forever and every
+                    # later self-heal pass skips an already-claimed workload, so
+                    # the node would keep reporting itself busy with a dead PID
+                    # until it restarts. CancelledError is a BaseException, so
+                    # the except-Exception handlers around here never see it.
+                    # Deliberately a plain attribute store rather than taking
+                    # _workload_lock: acquiring it would await, and awaiting
+                    # while a CancelledError propagates can drop the rollback.
+                    workload.completion_started = False
+
+            if self._is_process_alive(workload.pid):
+                logger.error(
+                    "Stale workload PID %s survived kill; keeping it tracked so "
+                    "the node stays truthfully busy.",
+                    workload.pid,
+                )
+                async with self._workload_lock:
+                    # Hand it back to the monitor loop, which runs the normal
+                    # completion flow once the process finally exits.
+                    workload.completion_started = False
+                continue
+
+            async with self._workload_lock:
+                self._active_workloads.pop(workload.pid, None)
+            freed += 1
+
+        if freed:
+            await self._save_workload_state()
+            logger.info("Self-heal freed %d stale workload(s)", freed)
+        return freed
 
     def _get_active_workload_count(self) -> int:
-        """Get count of active workloads."""
-        return len(self._active_workloads)
+        """Get count of workloads occupying the node (running + finalizing)."""
+        return len(self._active_workloads) + len(self._finalizing_workloads)
 
     def _cancellation_counts_as_success(self, workload_type: str) -> bool:
         """Return whether a cancelled workload type should complete successfully."""
         return workload_type in self.CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES
 
     async def _report_workload_startup_failure(
-        self, workload_uuid: Optional[str], error_msg: str
+        self,
+        workload_uuid: Optional[str],
+        error_msg: str,
+        rejection_reason: Optional[str] = None,
     ) -> None:
         """Mark an assigned workload as ``failed`` when it never got to run.
 
@@ -597,6 +820,13 @@ class CloudNode:
         backend fail the session immediately with an actionable reason (e.g.
         "controller host is busy") instead of a misleading deploy-timeout.
 
+        ``rejection_reason`` is a machine-readable classification of the
+        rejection (e.g. ``"host_busy"``). The backend uses it to decide whether
+        the failure is transient scheduling noise it should requeue (a busy
+        host) rather than a terminal workload failure. It is reported alongside
+        ``rejecting_instance_uuid`` so the backend can tell a live rejection
+        from a redelivered one that no longer matches the workload's instance.
+
         Best-effort: a missing ``workload_uuid`` or an MQTT error is logged and
         swallowed so it can never mask the original rejection.
         """
@@ -609,17 +839,25 @@ class CloudNode:
                 workload_uuid,
             )
             return
+        additional_data = {
+            # ``error`` is what the controller-session schema surfaces to
+            # the UI (resolve_failure_detail); ``failure_detail`` mirrors
+            # it into workload metadata for operator diagnostics.
+            "error": error_msg,
+            "failure_detail": error_msg,
+        }
+        if rejection_reason:
+            additional_data["rejection_reason"] = rejection_reason
+            if self.instance_uuid:
+                # Identifies the host that refused the start, so the backend can
+                # ignore a late/redelivered rejection instead of acting on it
+                # after the workload moved to another instance.
+                additional_data["rejecting_instance_uuid"] = str(self.instance_uuid)
         try:
             await self._mqtt_client.update_workload_status(
                 workload_uuid=str(workload_uuid),
                 status="failed",
-                additional_data={
-                    # ``error`` is what the controller-session schema surfaces to
-                    # the UI (resolve_failure_detail); ``failure_detail`` mirrors
-                    # it into workload metadata for operator diagnostics.
-                    "error": error_msg,
-                    "failure_detail": error_msg,
-                },
+                additional_data=additional_data,
             )
             logger.info("Reported startup failure for workload %s: %s", workload_uuid, error_msg)
         except (MQTTError, asyncio.TimeoutError) as exc:
@@ -628,6 +866,55 @@ class CloudNode:
                 workload_uuid,
                 exc,
             )
+
+    async def _start_workload_if_free(
+        self,
+        workload_type: str,
+        params: dict,
+        request_id: Optional[str],
+        workload_uuid: Optional[str],
+        stop_hint: str,
+    ) -> None:
+        """Spawn ``workload_type`` unless the node is occupied; reject if it is.
+
+        The busy check and the spawn run under ``_start_lock`` as one critical
+        section. They must: the check is no longer instantaneous (it reconciles
+        stale workloads against the backend first, which can take seconds), MQTT
+        delivery is at-least-once, and every command is handled in its own task
+        — so an unguarded check-then-spawn lets two concurrent start commands
+        both find an idle node and both spawn a process on it.
+
+        A rejection is reported to the backend as ``host_busy`` so it requeues
+        the workload rather than terminally failing it.
+        """
+        async with self._start_lock:
+            if await self._is_node_busy_after_self_heal():
+                # During a result upload there is nothing for the operator to
+                # stop — the host frees itself once the upload lands.
+                advice = (
+                    "The host frees itself once the upload finishes."
+                    if not self._active_workloads
+                    else stop_hint
+                )
+                # Keep the "Controller host is busy with" prefix: backends that
+                # predate ``rejection_reason`` classify the rejection from it.
+                error_msg = (
+                    f"Controller host is busy with {self._busy_state_summary()}. {advice}"
+                )
+                logger.warning(
+                    "Node is busy with %s. Rejecting %s request %s",
+                    self._busy_state_summary(),
+                    workload_type,
+                    request_id,
+                )
+                self._publish_response(request_id, success=False, error=error_msg)
+                await self._report_workload_startup_failure(
+                    workload_uuid, error_msg, rejection_reason="host_busy"
+                )
+                return
+
+            logger.info(f"Starting {workload_type} workload (request_id: {request_id})")
+            await self._spawn_workload_process(workload_type, params, request_id)
 
     async def _handle_inference(self, params: dict, request_id: Optional[str]) -> None:
         """Handle an inference command by spawning a detached process."""
@@ -639,21 +926,13 @@ class CloudNode:
                 await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
-            if self._is_node_busy():
-                error_msg = (
-                    f"Controller host is busy with {self._get_active_workload_count()} "
-                    f"active workload(s). Stop the existing controller before starting a new one."
-                )
-                logger.warning(
-                    f"Node is busy with {self._get_active_workload_count()} active workload(s). "
-                    f"Rejecting inference request {request_id}"
-                )
-                self._publish_response(request_id, success=False, error=error_msg)
-                await self._report_workload_startup_failure(workload_uuid, error_msg)
-                return
-
-            logger.info(f"Starting inference workload (request_id: {request_id})")
-            await self._spawn_workload_process("inference", params, request_id)
+            await self._start_workload_if_free(
+                "inference",
+                params,
+                request_id,
+                workload_uuid,
+                stop_hint="Stop the existing controller before starting a new one.",
+            )
 
         except Exception as e:
             error_msg = f"Failed to start inference: {str(e)}"
@@ -673,21 +952,13 @@ class CloudNode:
                 await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
-            if self._is_node_busy():
-                error_msg = (
-                    f"Controller host is busy with {self._get_active_workload_count()} "
-                    f"active workload(s). Stop the existing workload before starting a new one."
-                )
-                logger.warning(
-                    f"Node is busy with {self._get_active_workload_count()} active workload(s). "
-                    f"Rejecting training request {request_id}"
-                )
-                self._publish_response(request_id, success=False, error=error_msg)
-                await self._report_workload_startup_failure(workload_uuid, error_msg)
-                return
-
-            logger.info(f"Starting training workload (request_id: {request_id})")
-            await self._spawn_workload_process("training", params, request_id)
+            await self._start_workload_if_free(
+                "training",
+                params,
+                request_id,
+                workload_uuid,
+                stop_hint="Stop the existing workload before starting a new one.",
+            )
 
         except Exception as e:
             error_msg = f"Failed to start training: {str(e)}"
@@ -707,21 +978,13 @@ class CloudNode:
                 await self._report_workload_startup_failure(workload_uuid, error_msg)
                 return
 
-            if self._is_node_busy():
-                error_msg = (
-                    f"Controller host is busy with {self._get_active_workload_count()} "
-                    f"active workload(s). Stop the existing workload before starting a new one."
-                )
-                logger.warning(
-                    f"Node is busy with {self._get_active_workload_count()} active workload(s). "
-                    f"Rejecting simulate request {request_id}"
-                )
-                self._publish_response(request_id, success=False, error=error_msg)
-                await self._report_workload_startup_failure(workload_uuid, error_msg)
-                return
-
-            logger.info(f"Starting simulate workload (request_id: {request_id})")
-            await self._spawn_workload_process("simulate", params, request_id)
+            await self._start_workload_if_free(
+                "simulate",
+                params,
+                request_id,
+                workload_uuid,
+                stop_hint="Stop the existing workload before starting a new one.",
+            )
 
         except Exception as e:
             error_msg = f"Failed to start simulate: {str(e)}"
@@ -734,15 +997,20 @@ class CloudNode:
 
     async def _handle_status(self, request_id: Optional[str]) -> None:
         """Handle a status query."""
+        def _describe(w: ActiveWorkload) -> dict:
+            return {
+                "pid": w.pid,
+                "type": w.workload_type,
+                "request_id": w.request_id,
+                "running_for_seconds": int(time.time() - w.started_at),
+            }
+
         async with self._workload_lock:
-            active_workloads_info = [
-                {
-                    "pid": w.pid,
-                    "type": w.workload_type,
-                    "request_id": w.request_id,
-                    "running_for_seconds": int(time.time() - w.started_at),
-                }
-                for w in self._active_workloads.values()
+            active_workloads_info = [_describe(w) for w in self._active_workloads.values()]
+            # Reported separately so an operator can tell "still computing"
+            # from "still uploading results" — both keep ``is_busy`` true.
+            finalizing_workloads_info = [
+                _describe(w) for w in self._finalizing_workloads.values()
             ]
 
         self._publish_response(
@@ -758,6 +1026,7 @@ class CloudNode:
                     "has_training": bool(self.config.training),
                     "is_busy": self._is_node_busy(),
                     "active_workloads": active_workloads_info,
+                    "finalizing_workloads": finalizing_workloads_info,
                 }
             ),
         )
@@ -1527,20 +1796,26 @@ class CloudNode:
     def _classify_recovered_workload(self, data: dict) -> Optional[str]:
         """Decide whether a recovered *live* PID is a stale orphan to kill.
 
+        Thin wrapper over :meth:`_classify_stale_workload` for the startup
+        recovery path, which works on raw ``active_workloads.json`` entries.
+        """
+        return self._classify_stale_workload(data.get("workload_uuid"))
+
+    def _classify_stale_workload(self, workload_uuid: Optional[str]) -> Optional[str]:
+        """Decide whether a live tracked workload is a stale orphan to kill.
+
         Returns a human-readable reason string when the backend authoritatively
         says the workload is terminal, no longer exists, or is bound to a
-        *different* instance — meaning the live process is a leftover from a
-        previous session that must be terminated so this node frees up.
+        *different* instance — meaning the live process is a leftover that must
+        be terminated so this node frees up.
 
-        Returns ``None`` (reattach) when the workload is still valid for this
+        Returns ``None`` (keep it) when the workload is still valid for this
         node, when there is no ``workload_uuid`` to check, or when the backend
         cannot be reached — an inconclusive check must never kill a process, or
-        a transient network blip at startup would take down a healthy
-        controller.
+        a transient network blip would take down a healthy controller.
         """
-        workload_uuid = data.get("workload_uuid")
         if not workload_uuid:
-            # Nothing to reconcile against; keep the current best-effort reattach.
+            # Nothing to reconcile against; keep the current best-effort tracking.
             return None
 
         try:
@@ -1711,13 +1986,25 @@ class CloudNode:
             return False
 
     async def _claim_workload_completion(self, workload: ActiveWorkload) -> bool:
-        """Ensure completion side effects run only once per workload."""
+        """Ensure completion side effects run only once per workload.
+
+        The claim moves the workload from "running" to "finalizing" rather than
+        dropping it: collecting output and uploading result files can run for
+        many minutes on large artifacts, and the node must keep reporting itself
+        busy for that whole phase. ``_release_finalizing_workload`` ends it.
+        """
         async with self._workload_lock:
             if workload.completion_started:
                 return False
             workload.completion_started = True
             self._active_workloads.pop(workload.pid, None)
+            self._finalizing_workloads[workload.pid] = workload
             return True
+
+    async def _release_finalizing_workload(self, workload: ActiveWorkload) -> None:
+        """Stop counting a workload as occupying the node once completion ends."""
+        async with self._workload_lock:
+            self._finalizing_workloads.pop(workload.pid, None)
 
     async def _file_chunk_stream(
         self, file_path: Path, chunk_size: int = 1024 * 1024
@@ -1779,15 +2066,17 @@ class CloudNode:
             workload: The completed workload
             exit_code: Optional exit code if already captured (to avoid race conditions)
         """
-        try:
-            if not await self._claim_workload_completion(workload):
-                logger.info(
-                    "Skipping duplicate completion for workload %s (PID %s)",
-                    workload.workload_uuid or workload.request_id or workload.workload_type,
-                    workload.pid,
-                )
-                return
+        # Claim outside the try/finally below: a losing claimant does not own
+        # the finalizing entry and must not release someone else's.
+        if not await self._claim_workload_completion(workload):
+            logger.info(
+                "Skipping duplicate completion for workload %s (PID %s)",
+                workload.workload_uuid or workload.request_id or workload.workload_type,
+                workload.pid,
+            )
+            return
 
+        try:
             await self._save_workload_state()
 
             cancellation_counts_as_success = (
@@ -1968,6 +2257,11 @@ class CloudNode:
 
         except Exception as e:
             logger.error(f"Error handling workload completion: {e}", exc_info=True)
+        finally:
+            # Uploads are done (or gave up): the host is free again. Releasing
+            # here rather than at the claim is what keeps the node reporting
+            # itself busy for the whole finalizing phase.
+            await self._release_finalizing_workload(workload)
 
     async def _upload_result_files(self, workload: ActiveWorkload) -> dict[str, int | bool]:
         """Upload result files from the results folder to the backend.
@@ -2425,6 +2719,34 @@ class CloudNode:
         delivery_failures_before_alert = max(1, 120 // max(1, self.config.heartbeat_interval))
 
         while self._running:
+            # Self-heal BEFORE reporting state: drop any tracked workloads the
+            # backend already terminalized, so the heartbeat — and the backend's
+            # BUSY→READY release it drives — always reflects post-cleanup
+            # reality. Best-effort and time-boxed: the reconcile makes a
+            # synchronous backend call per workload (30 s client timeout) and
+            # can wait seconds on a kill, so an unbounded pass would delay the
+            # heartbeat past the backend's stale window and get the instance
+            # reaped — the very thing this loop exists to prevent. Whatever it
+            # did not finish is retried on the next beat.
+            if self._active_workloads:
+                budget = self._self_heal_budget_seconds()
+                try:
+                    await asyncio.wait_for(
+                        # The budget stops the pass picking up candidates it
+                        # cannot finish; the wait_for is the hard ceiling for a
+                        # single candidate that overruns. Safe to cancel: an
+                        # unfinished kill rolls its completion claim back.
+                        self._reconcile_stale_workloads(budget=budget),
+                        timeout=budget,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Stale-workload self-heal did not finish in time; "
+                        "heartbeating with the current state and retrying next beat."
+                    )
+                except Exception as exc:
+                    logger.warning("Stale-workload self-heal before heartbeat failed: %s", exc)
+
             try:
                 if self._mqtt_client:
                     response = await self._mqtt_client.send_heartbeat(

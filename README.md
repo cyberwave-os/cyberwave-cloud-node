@@ -334,12 +334,39 @@ Training and inference jobs run as **independent OS processes** that survive Clo
      }
      ```
 
-4. **Workload Cancellation**:
+4. **Stale-Workload Self-Healing**:
+   - The node re-checks each tracked workload with Cyberwave and terminates the
+     ones that are no longer active, so a leftover process cannot keep the node
+     busy forever
+   - Runs at startup, before every heartbeat, and before rejecting an incoming
+     workload for being busy — so the capacity the node reports reflects what is
+     actually still running
+   - An inconclusive check (Cyberwave temporarily unreachable, for example)
+     always keeps the process: a transient network problem never kills a healthy
+     workload
+   - A process that cannot be terminated stays tracked, so the node keeps
+     reporting itself busy rather than accepting work it cannot run
+   - Terminating a stale workload never emits a duplicate completion for it
+   - The check is time-boxed so it can never delay the node's heartbeat; an
+     unfinished pass is simply retried on the next one
+
+5. **Result Uploads Keep the Node Busy**:
+   - A workload is not finished when its process exits — the node still collects
+     its output and uploads its result files, which for large artifacts takes
+     minutes
+   - The node reports itself busy for that whole window and declines new
+     workloads, so an upload is never starved by a job started on top of it
+   - A declined workload is not lost: Cyberwave puts it back in the queue and
+     retries it, with a growing delay, once a host is genuinely free
+   - The node also serialises its own start handling, so two start requests that
+     arrive at the same moment can never both land on it
+
+6. **Workload Cancellation**:
    - Backend can cancel workloads by PID or request_id
    - Supports graceful (SIGTERM) or force (SIGKILL) termination
    - Sends cancellation notification to original workload request
 
-5. **Graceful Shutdown**: When Cloud Node shuts down (Ctrl+C, SIGTERM, SIGINT):
+7. **Graceful Shutdown**: When Cloud Node shuts down (Ctrl+C, SIGTERM, SIGINT):
    - ✅ Stops accepting new commands
    - ✅ Cancels background monitoring tasks
    - ✅ Logs running workload PIDs and output file locations
@@ -367,10 +394,10 @@ Workload output is streamed to:
 
 These files are also streamed to the backend **during the run** (not only at
 exit) for live monitoring: a background loop tails each active workload's
-stdout/stderr from the last-sent byte offset and forwards new content via the
-same `send_log` MQTT path (→ `NodeInstanceLog`). The completion/cancel handler
-sends only the remaining tail, so nothing is double-sent. This is what powers
-the frontend "Policy decision logs" panel for online RL inference.
+stdout/stderr from the last-sent byte offset and forwards new content over the
+same MQTT log path. The completion/cancel handler sends only the remaining tail,
+so nothing is double-sent. This is what powers the "Policy decision logs" panel
+for online RL inference.
 
 The same tailed content is **also mirrored to the node's own stdout/stderr**, so
 it shows up in `docker logs` for the container. Without this, `docker logs` only
@@ -389,7 +416,7 @@ per-step inference detail with `CYBERWAVE_RL_DEBUG=1` (see `cyberwave-rl-task`).
   than `MQTTError`/`TimeoutError` killed the flush loop and silenced all further
   logs).
 
-## Manifest Schema (CYB-1550)
+## Manifest Schema
 
 Starting with `cyberwave>=0.3.46`, `cyberwave.yml` is validated against a
 Pydantic v2 schema (`cyberwave.manifest.ManifestSchema`).  Both key formats
@@ -425,8 +452,8 @@ cyberwave manifest validate cyberwave.yml --lenient
 ### New fields available
 
 - `workers:` — list of `.py` files using `@cw.on_frame` hooks (loaded at startup)
-- `requirements:` — pip package specs (parsed, execution deferred to CYB-1546)
-- `models:` — model IDs to pre-download (parsed, execution deferred to CYB-1546)
+- `requirements:` — pip package specs (parsed; installation not yet performed)
+- `models:` — model IDs to pre-download (parsed; download not yet performed)
 - `input:` — input declaration (string normalised to list)
 - `gpu:` — hardware routing flag
 - `resources:` — memory / cpus constraints
@@ -434,7 +461,7 @@ cyberwave manifest validate cyberwave.yml --lenient
 
 ## TODO
 
-- Try it on a real repo - I cloned https://github.com/cyberwave-os/openvla-oft into this workspace
+- Try it on a real repo - I cloned https://github.com/cyberwave-os/cyberwave-compute-smolvla into this workspace
 - Add a Nuitka github action to build it as a binary
 
 ## MuJoCo Docker Example
