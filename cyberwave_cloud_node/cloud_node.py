@@ -1167,9 +1167,8 @@ class CloudNode:
             cancellation_counts_as_success = self._cancellation_counts_as_success(
                 workload.workload_type
             )
-            if cancellation_counts_as_success:
-                workload.cancel_requested = True
-                workload.cancel_signal = signal_name
+            workload.cancel_requested = True
+            workload.cancel_signal = signal_name
 
             # Check if process is still alive
             if not self._is_process_alive(workload.pid):
@@ -1206,51 +1205,40 @@ class CloudNode:
                 process.send_signal(sig)
 
             if cancellation_counts_as_success:
-                # Wait for process to actually die (critical for controller safety)
-                for _ in range(25):  # 25 * 0.2s = 5s
-                    await asyncio.sleep(0.2)
-                    if not self._is_process_alive(workload.pid):
-                        break
-
-                if self._is_process_alive(workload.pid):
-                    logger.warning(
-                        f"Process {workload.pid} survived SIGTERM after 5s, escalating to SIGKILL"
-                    )
-                    try:
-                        if hasattr(os, "killpg"):
-                            os.killpg(workload.pid, signal.SIGKILL)
-                        else:
-                            psutil.Process(workload.pid).kill()
-                    except (ProcessLookupError, psutil.NoSuchProcess):
-                        pass
-                    # Wait briefly for SIGKILL
-                    for _ in range(10):  # 10 * 0.2s = 2s
-                        await asyncio.sleep(0.2)
-                        if not self._is_process_alive(workload.pid):
-                            break
-
-                # Remove from active workloads
-                async with self._workload_lock:
-                    self._active_workloads.pop(workload.pid, None)
-
-                # Notify backend
-                if workload.workload_uuid and self._mqtt_client:
-                    try:
-                        await self._mqtt_client.update_workload_status(
-                            workload_uuid=workload.workload_uuid,
-                            status="cancelled",
-                            additional_data={
-                                "message": f"Workload cancelled by {signal_name}",
-                                "signal": signal_name,
-                                "pid": workload.pid,
-                            },
-                        )
-                    except Exception as notify_err:
-                        logger.warning(
-                            f"Failed to notify backend of workload cancellation: {notify_err}"
-                        )
-
-                return True, f"Workload cancelled with {signal_name}"
+                # SIGNAL AND RETURN. The workload stays in `_active_workloads`
+                # and the monitor loop reports it once the process actually
+                # exits, via the ordinary completion flow (which reads
+                # `cancel_requested` / `cancel_signal` set above).
+                #
+                # This used to wait 5s, escalate to SIGKILL, pop the workload and
+                # tell the backend "cancelled" -- roughly 450ms after the signal
+                # on a healthy shutdown. Two things went wrong with that:
+                #
+                #   - The backend was told the simulation had stopped while it
+                #     was still stopping. A cyberwave-sim declared-topology
+                #     workload tears down six containers on the way out, measured
+                #     at ~95s, so the node advertised itself free while its
+                #     containers were still running and still commanding a twin.
+                #   - Everything the workload logged during that teardown was
+                #     lost. `_stream_active_workload_logs` only walks
+                #     `_active_workloads`, so popping it here stopped the stream:
+                #     every `declared-topology[stop]` and `[cleanup]` line reached
+                #     the on-disk file and nothing else -- precisely the lines you
+                #     need when cleanup leaves something behind.
+                #
+                # The 5s SIGKILL escalation went with it. It was written for a
+                # controller that must stop NOW, but it also capped every other
+                # workload's shutdown at 5s: a teardown needing 95s would have
+                # been killed 5s in with five of six containers still running.
+                # A workload that genuinely hangs is caught by the monitor loop's
+                # own timeout, which is the layer that knows how long this kind of
+                # workload is allowed to take.
+                logger.info(
+                    f"Cancellation requested for workload PID {workload.pid} "
+                    f"({workload.workload_type}); waiting for it to exit before "
+                    "reporting to the backend"
+                )
+                return True, f"{signal_name} sent; cancellation requested"
 
             # For SIGKILL, wait briefly to confirm termination
             if signal_name == "SIGKILL":
