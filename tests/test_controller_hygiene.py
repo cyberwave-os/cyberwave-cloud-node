@@ -17,6 +17,7 @@ deps are stubbed into ``sys.modules`` before importing the cloud node.
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import time
@@ -173,6 +174,33 @@ class RecoverLocalWorkloadsHygieneTests(unittest.TestCase):
             return_value=Path(tmp_dir),
         ):
             asyncio.run(node._recover_local_workloads())
+
+    def test_config_dir_override_isolates_workload_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shared_dir = Path(tmp_dir) / "shared-home" / ".cyberwave"
+            shared_dir.mkdir(parents=True)
+            shared_state = shared_dir / "active_workloads.json"
+            shared_state.write_text('{"sentinel": true}')
+            isolated_dir = Path(tmp_dir) / "sim-node-state"
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CYBERWAVE_EDGE_CONFIG_DIR": str(isolated_dir)},
+                ),
+                patch(
+                    "cyberwave_cloud_node.cloud_node.Path.home",
+                    return_value=Path(tmp_dir) / "shared-home",
+                ),
+            ):
+                node = _make_node(tmp_dir)
+                asyncio.run(node._save_workload_state())
+
+            self.assertEqual(shared_state.read_text(), '{"sentinel": true}')
+            self.assertEqual(
+                json.loads((isolated_dir / "active_workloads.json").read_text()),
+                {},
+            )
 
     def test_terminal_backend_workload_is_killed_not_reattached(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

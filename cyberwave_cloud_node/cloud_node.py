@@ -71,6 +71,18 @@ _WORKLOAD_FN_MAP: dict[str, str] = {
 _API_CREDENTIAL_ENV_VARS = ("CYBERWAVE_API_KEY", "CYBERWAVE_MQTT_PASSWORD")
 
 
+def _cloud_node_state_dir() -> Path:
+    """Return the state directory shared with the credentials module.
+
+    ``CYBERWAVE_EDGE_CONFIG_DIR`` already scopes credentials and instance
+    identity.  Honour the same override for workload recovery and logs so two
+    node processes on one host cannot adopt or erase each other's workloads.
+    Keep the historical home-directory default when no override is supplied.
+    """
+    configured = os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "").strip()
+    return Path(configured) if configured else Path.home() / ".cyberwave"
+
+
 @contextmanager
 def _scoped_api_credential(token: str) -> Iterator[None]:
     """Temporarily expose ``token`` as the process API credential.
@@ -245,7 +257,7 @@ class CloudNode:
         self._module_dispatch_lock = asyncio.Lock()
 
         # Directory for workload output files
-        self._workload_output_dir = Path.home() / ".cyberwave" / "workload_logs"
+        self._workload_output_dir = _cloud_node_state_dir() / "workload_logs"
         self._workload_output_dir.mkdir(parents=True, exist_ok=True)
 
         # Log buffers for cloud node itself (not workload output)
@@ -1683,7 +1695,7 @@ class CloudNode:
 
     async def _save_workload_state(self):
         """Persist active workloads to local file."""
-        state_file = Path.home() / ".cyberwave" / "active_workloads.json"
+        state_file = _cloud_node_state_dir() / "active_workloads.json"
 
         async with self._workload_lock:
             state = {
@@ -1710,7 +1722,7 @@ class CloudNode:
 
     async def _recover_local_workloads(self):
         """Load workload state from local file and reattach to running processes."""
-        state_file = Path.home() / ".cyberwave" / "active_workloads.json"
+        state_file = _cloud_node_state_dir() / "active_workloads.json"
 
         if not state_file.exists():
             logger.info("No workload state file found")
@@ -2033,7 +2045,25 @@ class CloudNode:
             for line in reversed(text.strip().splitlines()):
                 stripped = line.strip()
                 if stripped:
-                    return stripped[:300]
+                    # Workload stderr commonly uses Python's default
+                    # ``timestamp - logger - LEVEL - message`` format. The
+                    # prefix is useful in raw logs but wastes most of the small
+                    # user-facing summary and can leave the useful remedy cut
+                    # in half.
+                    parts = stripped.split(" - ", 3)
+                    if (
+                        len(parts) == 4
+                        and parts[0][:4].isdigit()
+                        and parts[2]
+                        in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+                    ):
+                        stripped = parts[3].strip()
+
+                    max_chars = 500
+                    if len(stripped) <= max_chars:
+                        return stripped
+                    prefix = stripped[: max_chars - 1].rsplit(" ", 1)[0]
+                    return f"{prefix or stripped[: max_chars - 1]}…"
             return None
 
         line = _last_meaningful_line(stderr_content) or _last_meaningful_line(stdout_content)

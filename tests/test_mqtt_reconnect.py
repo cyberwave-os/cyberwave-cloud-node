@@ -54,6 +54,36 @@ from cyberwave_cloud_node.mqtt import (  # noqa: E402
 
 
 class MQTTReconnectTests(unittest.TestCase):
+    def test_failure_summary_removes_log_prefix_without_cutting_remedy(self) -> None:
+        summary = CloudNode._summarize_failure(
+            stderr_content=(
+                "2026-08-31 16:01:45,156 - sim_workload_runner - ERROR - "
+                "ROS2 runtime image is missing locally and could not be pulled. "
+                "Check CYBERWAVE_ROS2_SIM_IMAGE on this node."
+            ),
+            stdout_content="",
+            exit_code=1,
+            workload_type="simulate",
+        )
+
+        self.assertEqual(
+            summary,
+            "ROS2 runtime image is missing locally and could not be pulled. "
+            "Check CYBERWAVE_ROS2_SIM_IMAGE on this node.",
+        )
+
+    def test_failure_summary_truncates_on_a_word_boundary(self) -> None:
+        summary = CloudNode._summarize_failure(
+            stderr_content="failure " * 100,
+            stdout_content="",
+            exit_code=1,
+            workload_type="simulate",
+        )
+
+        self.assertLessEqual(len(summary), 500)
+        self.assertTrue(summary.endswith("…"))
+        self.assertTrue(summary.removesuffix("…").endswith("failure"))
+
     def test_config_reads_simulate_command(self) -> None:
         config = CloudNodeConfig.from_dict(
             {"cyberwave-cloud-node": {"simulate": "python run_sim_workload.py --params {body}"}}
