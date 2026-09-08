@@ -313,6 +313,11 @@ Training and inference jobs run as **independent OS processes** that survive Clo
    - Checks every 5 seconds if workload processes are still alive
    - Collects results when processes complete
    - Publishes completion status and output back via MQTT
+   - Keeps local logs and parameters if execution fails or backend completion is
+     unconfirmed, including a timeout, rejection, or missing MQTT connection.
+     A successful process exit alone does not permit cleanup. The host becomes
+     available after finalization; retained files do not mean it is still running.
+     This preserves diagnostics, not an automatic completion retry/outbox.
 
 3. **Node Capacity & Status**:
    - Cloud Node tracks active workloads by PID

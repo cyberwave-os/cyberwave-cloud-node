@@ -67,6 +67,7 @@ from cyberwave_cloud_node.cloud_node import (  # noqa: E402
     CloudNode,
 )
 from cyberwave_cloud_node.config import CloudNodeConfig  # noqa: E402
+from cyberwave_cloud_node.mqtt import MQTTError  # noqa: E402
 
 
 def _make_node(tmp_dir: str, **config_kwargs) -> CloudNode:
@@ -369,9 +370,7 @@ class StaleWorkloadSelfHealTests(unittest.TestCase):
             self.assertEqual(kwargs["additional_data"]["rejection_reason"], "host_busy")
             # Identifies the rejecting host so the backend can ignore this
             # report if it is redelivered after the workload moved on.
-            self.assertEqual(
-                kwargs["additional_data"]["rejecting_instance_uuid"], "this-instance"
-            )
+            self.assertEqual(kwargs["additional_data"]["rejecting_instance_uuid"], "this-instance")
 
     def test_unkillable_stale_workload_keeps_node_truthfully_busy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -463,9 +462,7 @@ class StaleWorkloadSelfHealTests(unittest.TestCase):
 
             async def _cancel_mid_kill() -> None:
                 with self.assertRaises(asyncio.TimeoutError):
-                    await asyncio.wait_for(
-                        node._reconcile_stale_workloads(), timeout=0.1
-                    )
+                    await asyncio.wait_for(node._reconcile_stale_workloads(), timeout=0.1)
 
             asyncio.run(_cancel_mid_kill())
 
@@ -514,9 +511,7 @@ class StaleWorkloadSelfHealTests(unittest.TestCase):
             node._reconcile_stale_workloads = _hanging_reconcile
 
             async def _run() -> bool:
-                return await asyncio.wait_for(
-                    node._is_node_busy_after_self_heal(), timeout=5
-                )
+                return await asyncio.wait_for(node._is_node_busy_after_self_heal(), timeout=5)
 
             # Returns the pre-cleanup answer instead of hanging on the reconcile.
             self.assertTrue(asyncio.run(_run()))
@@ -686,9 +681,7 @@ class FinalizingWorkloadBusyStateTests(unittest.TestCase):
 
             async def _upload_then_start() -> None:
                 await node._claim_workload_completion(workload)
-                await node._handle_inference(
-                    {"workload_uuid": "wl-new"}, request_id="req-n"
-                )
+                await node._handle_inference({"workload_uuid": "wl-new"}, request_id="req-n")
 
             asyncio.run(_upload_then_start())
 
@@ -715,6 +708,61 @@ class FinalizingWorkloadBusyStateTests(unittest.TestCase):
             asyncio.run(node._handle_workload_completion(workload, exit_code=0))
 
             self.assertEqual(node._finalizing_workloads, {})
+            self.assertFalse(node._is_node_busy())
+
+    def test_unacknowledged_completion_preserves_evidence_but_frees_node(self) -> None:
+        for error in (asyncio.TimeoutError(), MQTTError("Completion rejected while assigned")):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                node, workload = self._node_with_workload(tmp_dir)
+                node.config.upload_results = False
+                node._buffer_log = AsyncMock()
+                node._flush_logs = AsyncMock()
+                node._mqtt_client.complete_workload.side_effect = error
+                workload.stdout_file.write_text("Measured process output")
+                workload.stderr_file.write_text("Diagnostic warning")
+                params_file = workload.stdout_file.with_suffix(".params.json")
+                params_file.write_text('{"private_input": "retained locally"}')
+
+                asyncio.run(node._handle_workload_completion(workload, exit_code=0))
+
+                self.assertEqual(workload.stdout_file.read_text(), "Measured process output")
+                self.assertEqual(workload.stderr_file.read_text(), "Diagnostic warning")
+                self.assertTrue(params_file.exists())
+                self.assertFalse(node._is_node_busy())
+                node._mqtt_client.complete_workload.assert_awaited_once()
+
+    def test_missing_mqtt_preserves_completed_workload_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node, workload = self._node_with_workload(tmp_dir)
+            node.config.upload_results = False
+            node._mqtt_client = None
+            node._buffer_log = AsyncMock()
+            node._flush_logs = AsyncMock()
+            workload.stdout_file.write_text("Measured process output")
+            workload.stderr_file.write_text("")
+
+            asyncio.run(node._handle_workload_completion(workload, exit_code=0))
+
+            self.assertTrue(workload.stdout_file.exists())
+            self.assertTrue(workload.stderr_file.exists())
+            self.assertFalse(node._is_node_busy())
+
+    def test_acknowledged_completion_cleans_up_completed_workload_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node, workload = self._node_with_workload(tmp_dir)
+            node.config.upload_results = False
+            node._buffer_log = AsyncMock()
+            node._flush_logs = AsyncMock()
+            workload.stdout_file.write_text("Measured process output")
+            workload.stderr_file.write_text("")
+            params_file = workload.stdout_file.with_suffix(".params.json")
+            params_file.write_text("{}")
+
+            asyncio.run(node._handle_workload_completion(workload, exit_code=0))
+
+            self.assertFalse(workload.stdout_file.exists())
+            self.assertFalse(workload.stderr_file.exists())
+            self.assertFalse(params_file.exists())
             self.assertFalse(node._is_node_busy())
 
     def test_duplicate_completion_does_not_release_the_owners_claim(self) -> None:
@@ -802,8 +850,7 @@ class ConsoleMirrorTests(unittest.TestCase):
             out = self._mirror(node, wl, "[rltask] step 1\n[rltask] step 2\n", "stdout")
         self.assertEqual(
             out,
-            "[workload wl-abc stdout] [rltask] step 1\n"
-            "[workload wl-abc stdout] [rltask] step 2\n",
+            "[workload wl-abc stdout] [rltask] step 1\n[workload wl-abc stdout] [rltask] step 2\n",
         )
 
     def test_partial_line_is_held_then_completed(self) -> None:
@@ -827,9 +874,7 @@ class ConsoleMirrorTests(unittest.TestCase):
             out = self._mirror(
                 node, wl, "Traceback (most recent call last):", "stderr", flush_partial=True
             )
-        self.assertEqual(
-            out, "[workload wl-abc stderr] Traceback (most recent call last):\n"
-        )
+        self.assertEqual(out, "[workload wl-abc stderr] Traceback (most recent call last):\n")
 
     def test_stdout_and_stderr_use_separate_residuals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

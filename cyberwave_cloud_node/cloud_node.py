@@ -116,6 +116,7 @@ def _scoped_api_credential(token: str) -> Iterator[None]:
             else:
                 os.environ[name] = value
 
+
 # Forward-reference type for the optional manifest schema
 try:
     from cyberwave.manifest.schema import ManifestSchema as _ManifestSchemaType
@@ -658,9 +659,7 @@ class CloudNode:
             except Exception as exc:
                 # A cleanup hiccup must degrade to the plain busy answer, not
                 # fail the incoming workload with an unrelated error.
-                logger.warning(
-                    "Stale-workload self-heal before busy check failed: %s", exc
-                )
+                logger.warning("Stale-workload self-heal before busy check failed: %s", exc)
         return self._is_node_busy()
 
     def _self_heal_budget_seconds(self) -> float:
@@ -704,15 +703,11 @@ class CloudNode:
 
         Returns the number of workloads freed.
         """
-        deadline = (
-            asyncio.get_running_loop().time() + budget if budget is not None else None
-        )
+        deadline = asyncio.get_running_loop().time() + budget if budget is not None else None
         async with self._reconcile_lock:
             return await self._reconcile_stale_workloads_locked(deadline=deadline)
 
-    async def _reconcile_stale_workloads_locked(
-        self, deadline: Optional[float] = None
-    ) -> int:
+    async def _reconcile_stale_workloads_locked(self, deadline: Optional[float] = None) -> int:
         """Body of :meth:`_reconcile_stale_workloads`; assumes the lock is held."""
         async with self._workload_lock:
             candidates = list(self._active_workloads.values())
@@ -910,9 +905,7 @@ class CloudNode:
                 )
                 # Keep the "Controller host is busy with" prefix: backends that
                 # predate ``rejection_reason`` classify the rejection from it.
-                error_msg = (
-                    f"Controller host is busy with {self._busy_state_summary()}. {advice}"
-                )
+                error_msg = f"Controller host is busy with {self._busy_state_summary()}. {advice}"
                 logger.warning(
                     "Node is busy with %s. Rejecting %s request %s",
                     self._busy_state_summary(),
@@ -1009,6 +1002,7 @@ class CloudNode:
 
     async def _handle_status(self, request_id: Optional[str]) -> None:
         """Handle a status query."""
+
         def _describe(w: ActiveWorkload) -> dict:
             return {
                 "pid": w.pid,
@@ -1021,9 +1015,7 @@ class CloudNode:
             active_workloads_info = [_describe(w) for w in self._active_workloads.values()]
             # Reported separately so an operator can tell "still computing"
             # from "still uploading results" — both keep ``is_busy`` true.
-            finalizing_workloads_info = [
-                _describe(w) for w in self._finalizing_workloads.values()
-            ]
+            finalizing_workloads_info = [_describe(w) for w in self._finalizing_workloads.values()]
 
         self._publish_response(
             request_id,
@@ -2054,8 +2046,7 @@ class CloudNode:
                     if (
                         len(parts) == 4
                         and parts[0][:4].isdigit()
-                        and parts[2]
-                        in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+                        and parts[2] in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
                     ):
                         stripped = parts[3].strip()
 
@@ -2235,6 +2226,10 @@ class CloudNode:
 
             # Step 3e: Notify the backend that the workload has completed via MQTT
             # This happens AFTER uploads are complete (or skipped)
+            # A successful process exit is not an acknowledged backend result.
+            # Keep local evidence when reporting is unavailable or rejected, so
+            # an assigned/running orphan remains diagnosable after the host frees.
+            completion_confirmed = not workload.workload_uuid
             if workload.workload_uuid and self._mqtt_client:
                 try:
                     await self._mqtt_client.complete_workload(
@@ -2245,16 +2240,17 @@ class CloudNode:
                         error=failure_error,
                         stderr=failure_stderr,
                     )
+                    completion_confirmed = True
                     logger.info(f"Workload {workload.workload_uuid} completion notified via MQTT")
                 except (MQTTError, asyncio.TimeoutError) as e:
                     logger.error(f"Failed to notify workload completion via MQTT: {e}")
 
             # Clean up workload files (log files and params file).
-            # On failure, KEEP the stdout/stderr/params on disk so the crash is
-            # diagnosable after the fact — the bounded stderr tail published over
+            # On failure or unconfirmed completion, KEEP stdout/stderr/params
+            # so the process outcome is diagnosable — the stderr tail sent over
             # MQTT is often empty or truncated, and deleting the files leaves no
             # way to recover the real traceback (see resolve_failure_detail).
-            if success:
+            if success and completion_confirmed:
                 workload.stdout_file.unlink(missing_ok=True)
                 workload.stderr_file.unlink(missing_ok=True)
 
@@ -2264,11 +2260,19 @@ class CloudNode:
                     / f"{workload.stdout_file.stem.replace('.stdout', '')}.params.json"
                 )
                 params_file.unlink(missing_ok=True)
-            else:
+            elif not success:
                 logger.warning(
                     "Workload %s failed (exit_code=%s); preserving logs for diagnosis: %s , %s",
                     workload.workload_uuid or workload.workload_type,
                     exit_code,
+                    workload.stdout_file,
+                    workload.stderr_file,
+                )
+            else:
+                logger.warning(
+                    "Workload %s exited successfully, but backend completion is "
+                    "unconfirmed; preserving local evidence: %s , %s",
+                    workload.workload_uuid,
                     workload.stdout_file,
                     workload.stderr_file,
                 )

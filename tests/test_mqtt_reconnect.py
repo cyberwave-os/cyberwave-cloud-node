@@ -54,6 +54,18 @@ from cyberwave_cloud_node.mqtt import (  # noqa: E402
 
 
 class MQTTReconnectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These transport tests must never overwrite an operator's recovered
+        # workload state after their short-lived Path.home patches end.
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        state_path = patch(
+            "cyberwave_cloud_node.cloud_node._cloud_node_state_dir",
+            return_value=Path(state_dir.name),
+        )
+        state_path.start()
+        self.addCleanup(state_path.stop)
+
     def test_failure_summary_removes_log_prefix_without_cutting_remedy(self) -> None:
         summary = CloudNode._summarize_failure(
             stderr_content=(
@@ -785,6 +797,8 @@ class MQTTReconnectTests(unittest.TestCase):
             success=True,
             exit_code=1,
             timeout=30.0,
+            error=None,
+            stderr=None,
         )
 
     def test_failed_workload_completion_reports_failure_metadata(self) -> None:
@@ -824,6 +838,8 @@ class MQTTReconnectTests(unittest.TestCase):
             success=False,
             exit_code=1,
             timeout=30.0,
+            error="ImportError: pymeshlab failed to import",
+            stderr="ImportError: pymeshlab failed to import",
         )
 
     def test_completion_is_deduplicated_after_cancel_handles_dead_process(self) -> None:
@@ -869,6 +885,8 @@ class MQTTReconnectTests(unittest.TestCase):
             success=True,
             exit_code=ANY,
             timeout=30.0,
+            error=None,
+            stderr=None,
         )
 
     def test_complete_workload_publishes_success_metadata(self) -> None:
