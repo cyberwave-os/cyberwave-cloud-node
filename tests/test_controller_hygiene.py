@@ -420,6 +420,55 @@ class StaleWorkloadSelfHealTests(unittest.TestCase):
             self.assertEqual(claimed_at_kill_time, [True])
             self.assertEqual(node._active_workloads, {})
 
+    def test_simulation_cleanup_is_not_killed_by_self_heal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node = self._busy_node(tmp_dir, "wl-stopping")
+            workload = node._active_workloads[555]
+            workload.workload_type = "simulate"
+            workload.cancel_requested = True
+            workload.cancel_signal = "SIGTERM"
+            workload.cancel_requested_at = time.monotonic()
+            node.client.get_workload = Mock(return_value={"status": "cancelled"})
+            node._kill_stale_process_group = AsyncMock()
+
+            self.assertEqual(asyncio.run(node._reconcile_stale_workloads()), 0)
+            node._kill_stale_process_group.assert_not_awaited()
+            self.assertTrue(node._is_node_busy())
+            self.assertFalse(workload.completion_started)
+
+    def test_expired_simulation_cleanup_is_reconciled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node = self._busy_node(tmp_dir, "wl-stuck")
+            workload = node._active_workloads[555]
+            workload.workload_type = "simulate"
+            workload.cancel_requested = True
+            workload.cancel_signal = "SIGTERM"
+            workload.cancel_requested_at = time.monotonic() - 121
+            node.client.get_workload = Mock(return_value={"status": "cancelled"})
+            node._kill_stale_process_group = AsyncMock()
+            node._is_process_alive = Mock(return_value=False)
+
+            self.assertEqual(asyncio.run(node._reconcile_stale_workloads()), 1)
+            node._kill_stale_process_group.assert_awaited_once_with(555)
+
+    def test_repeat_simulation_cancel_does_not_interrupt_or_extend_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node = self._busy_node(tmp_dir, "wl-stopping")
+            workload = node._active_workloads[555]
+            workload.workload_type = "simulate"
+            node._is_process_alive = Mock(return_value=True)
+            with patch("cyberwave_cloud_node.cloud_node.os.killpg") as kill:
+                self.assertTrue(asyncio.run(node._cancel_workload(workload))[0])
+                started = workload.cancel_requested_at
+                self.assertTrue(asyncio.run(node._cancel_workload(workload))[0])
+                self.assertEqual(kill.call_count, 1)
+                self.assertEqual(workload.cancel_requested_at, started)
+                self.assertTrue(node._is_node_busy())
+                # An explicit force-stop remains available during the grace window.
+                self.assertTrue(asyncio.run(node._cancel_workload(workload, "SIGKILL"))[0])
+                self.assertEqual(kill.call_count, 2)
+                self.assertFalse(node._simulation_shutdown_in_progress(workload))
+
     def test_workload_already_claimed_by_monitor_loop_is_left_alone(self) -> None:
         """A process that exited on its own belongs to the normal completion flow."""
         with tempfile.TemporaryDirectory() as tmp_dir:

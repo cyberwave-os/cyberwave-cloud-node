@@ -155,6 +155,7 @@ class ActiveWorkload:
     workload_uuid: Optional[str] = None  # UUID of the workload from backend
     cancel_requested: bool = False
     cancel_signal: Optional[str] = None
+    cancel_requested_at: Optional[float] = None
     completion_started: bool = False
     # Byte offsets already streamed to the backend, so the live log streamer and
     # the completion handler never re-send the same bytes (backend appends).
@@ -194,6 +195,7 @@ class CloudNode:
     """
 
     CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES = frozenset({"simulate", "inference"})
+    SIMULATION_SHUTDOWN_GRACE_SECONDS = 120.0
 
     def __init__(
         self,
@@ -716,6 +718,12 @@ class CloudNode:
 
         freed = 0
         for index, workload in enumerate(candidates):
+            # A cancelled backend row is expected while the simulator removes
+            # its containers. Re-signalling its process group kills the docker
+            # cleanup commands; the 3s stale-process escalation then orphans the
+            # plant. Keep the node busy during a bounded normal shutdown.
+            if self._simulation_shutdown_in_progress(workload):
+                continue
             if deadline is not None and asyncio.get_running_loop().time() >= deadline:
                 logger.warning(
                     "Self-heal budget spent after examining %d of %d workload(s); "
@@ -808,6 +816,16 @@ class CloudNode:
     def _cancellation_counts_as_success(self, workload_type: str) -> bool:
         """Return whether a cancelled workload type should complete successfully."""
         return workload_type in self.CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES
+
+    def _simulation_shutdown_in_progress(self, workload: ActiveWorkload) -> bool:
+        return (
+            workload.workload_type == "simulate"
+            and workload.cancel_requested
+            and workload.cancel_signal != "SIGKILL"
+            and workload.cancel_requested_at is not None
+            and time.monotonic() - workload.cancel_requested_at
+            < self.SIMULATION_SHUTDOWN_GRACE_SECONDS
+        )
 
     async def _report_workload_startup_failure(
         self,
@@ -1168,11 +1186,15 @@ class CloudNode:
             Tuple of (success: bool, message: str)
         """
         try:
+            if signal_name != "SIGKILL" and self._simulation_shutdown_in_progress(workload):
+                return True, "Simulation shutdown is already in progress"
             cancellation_counts_as_success = self._cancellation_counts_as_success(
                 workload.workload_type
             )
             workload.cancel_requested = True
             workload.cancel_signal = signal_name
+            if workload.cancel_requested_at is None:
+                workload.cancel_requested_at = time.monotonic()
 
             # Check if process is still alive
             if not self._is_process_alive(workload.pid):
@@ -1234,9 +1256,8 @@ class CloudNode:
                 # controller that must stop NOW, but it also capped every other
                 # workload's shutdown at 5s: a teardown needing 95s would have
                 # been killed 5s in with five of six containers still running.
-                # A workload that genuinely hangs is caught by the monitor loop's
-                # own timeout, which is the layer that knows how long this kind of
-                # workload is allowed to take.
+                # Self-healing permits a bounded simulation cleanup window
+                # before treating a still-live cancelled workload as stale.
                 logger.info(
                     f"Cancellation requested for workload PID {workload.pid} "
                     f"({workload.workload_type}); waiting for it to exit before "
