@@ -70,8 +70,8 @@ class MQTTReconnectTests(unittest.TestCase):
         summary = CloudNode._summarize_failure(
             stderr_content=(
                 "2026-08-31 16:01:45,156 - sim_workload_runner - ERROR - "
-                "ROS2 runtime image is missing locally and could not be pulled. "
-                "Check CYBERWAVE_ROS2_SIM_IMAGE on this node."
+                "Declared topology image could not be pulled. "
+                "Check the twin driver metadata on this node."
             ),
             stdout_content="",
             exit_code=1,
@@ -80,8 +80,8 @@ class MQTTReconnectTests(unittest.TestCase):
 
         self.assertEqual(
             summary,
-            "ROS2 runtime image is missing locally and could not be pulled. "
-            "Check CYBERWAVE_ROS2_SIM_IMAGE on this node.",
+            "Declared topology image could not be pulled. "
+            "Check the twin driver metadata on this node.",
         )
 
     def test_failure_summary_truncates_on_a_word_boundary(self) -> None:
