@@ -8,6 +8,7 @@ This module handles communication with the Cyberwave backend API for:
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -159,7 +160,6 @@ class CloudNodeClient:
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={
-                "Content-Type": "application/json",
                 "Accept": "application/json",
                 "Authorization": f"Token {self.token}",
             },
@@ -750,6 +750,20 @@ class CloudNodeClient:
             raise CloudNodeClientError(f"Connection error during signed URL request: {e}") from e
 
         raise CloudNodeClientError("Failed to get signed URL")
+
+    def upload_workload_attachment(
+        self, workload_uuid: str, attachment_uuid: str, file_path: Path, timeout: float
+    ) -> None:
+        """Stream an artifact to the authenticated local-storage endpoint."""
+        endpoint = f"/api/v1/cloud-node-workloads/{workload_uuid}/attachments/{attachment_uuid}/upload"
+        with file_path.open("rb") as content:
+            response = self._client.post(
+                endpoint,
+                files={"file": (file_path.name, content, "application/octet-stream")},
+                timeout=timeout,
+            )
+        if response.status_code != 200:
+            self._handle_error_response(response, "upload_workload_attachment")
 
     def upload_workload_results(
         self,

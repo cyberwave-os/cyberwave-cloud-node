@@ -60,3 +60,28 @@ class ValidateCredentialsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_binary_upload_builds_authenticated_multipart_request(tmp_path):
+    import httpx
+
+    requests = []
+    client_type = httpx.Client
+    def receive(request):
+        requests.append((request, request.read()))
+        return httpx.Response(200, json={"path": "stored"})
+    def make_http_client(**kwargs):
+        return client_type(transport=httpx.MockTransport(receive), trust_env=False, **kwargs)
+
+    artifact = tmp_path / "checkpoint.tar.gz"
+    artifact.write_bytes(b"\x1f\x8b\x00binary-checkpoint")
+    with patch.object(client_mod.httpx, "Client", side_effect=make_http_client):
+        client = CloudNodeClient(base_url="http://localhost:8419", token="test-token")
+    with client:
+        client.upload_workload_attachment("workload-id", "attachment-id", artifact, 300)
+        client.get_signed_url_for_attachment("workload-id", artifact.name)
+    upload, body = requests[0]
+    assert upload.headers["content-type"].startswith("multipart/form-data; boundary=")
+    assert upload.headers["authorization"] == "Token test-token"
+    assert b"\x1f\x8b\x00binary-checkpoint" in body
+    assert requests[1][0].headers["content-type"] == "application/json"

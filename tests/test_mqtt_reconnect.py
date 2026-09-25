@@ -316,6 +316,28 @@ class MQTTReconnectTests(unittest.TestCase):
         spawned_env = mock_popen.call_args.kwargs["env"]
         self.assertEqual(spawned_env.get("CYBERWAVE_API_KEY"), "resolved-token-123")
 
+    def test_training_runs_keep_artifacts_in_distinct_persisted_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("cyberwave_cloud_node.cloud_node.Path.home", return_value=Path(tmp_dir)):
+                node = CloudNode(
+                    config=CloudNodeConfig(
+                        training="python train.py {body}",
+                        upload_results=True,
+                        results_folder="results",
+                    ),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+            with (
+                patch.object(node, "_save_workload_state", new=AsyncMock()),
+                patch("cyberwave_cloud_node.cloud_node.subprocess.Popen", side_effect=[Mock(pid=41), Mock(pid=42)]),
+            ):
+                for number in (1, 2):
+                    asyncio.run(node._spawn_workload_process("training", {}, f"run-{number}"))
+            directories = [Path(w.params["results_folder"]) for w in node._active_workloads.values()]
+            self.assertEqual(len(set(directories)), 2)
+            self.assertTrue(all(p.parent == (Path(tmp_dir) / "results").resolve() for p in directories))
+
     def test_spawn_workload_process_keeps_running_when_status_update_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch(

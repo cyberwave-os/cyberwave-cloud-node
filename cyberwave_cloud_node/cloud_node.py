@@ -1426,6 +1426,12 @@ class CloudNode:
                 logger.error(f"Failed to process image_bytes_base64: {e}", exc_info=True)
                 # Continue without image - let the script handle the error
 
+        if workload_type == "training" and self.config.upload_results:
+            # Both supported trainers accept results_folder. Give every run its
+            # own directory; failed uploads must never be adopted by the next run.
+            results_root = (self.working_dir / self.config.results_folder).resolve()
+            params["results_folder"] = str(results_root / f"workload-{uuid.uuid4()}")
+
         # For large payloads, write params to a temp file and pass the filename
         # This avoids "Argument list too long" errors
         params_json = json.dumps(params)
@@ -2230,6 +2236,10 @@ class CloudNode:
             if should_upload:
                 # Check if result files exist before sending "finalizing" status
                 upload_result = await self._upload_result_files(workload)
+                if upload_result["failed_count"]:
+                    success = False
+                    failure_error = "Training or computation finished, but result files could not be saved. Local artifacts were retained."
+                    result_data.update(success=False, error=failure_error)
                 if upload_result["files_found"]:
                     logger.info(
                         f"Result file upload completed for workload {workload.workload_uuid}: "
@@ -2333,6 +2343,13 @@ class CloudNode:
         else:
             results_path = (self.working_dir / self.config.results_folder).resolve()
 
+        if workload.workload_type == "training" and workload.params.get("results_folder"):
+            scoped_path = Path(workload.params["results_folder"]).resolve()
+            if not scoped_path.is_relative_to(results_path.resolve()):
+                logger.error("Training result directory is outside the configured result root")
+                return {"files_found": False, "uploaded_count": 0, "failed_count": 1}
+            results_path = scoped_path
+
         logger.info(
             f"Scanning results folder: {results_path} "
             f"(working_dir: {self.working_dir}, config.results_folder: {self.config.results_folder})"
@@ -2405,78 +2422,56 @@ class CloudNode:
                 signed_url = None
                 for attempt in range(1, max_attempts + 1):
                     try:
-                        # Fetch a fresh signed URL for each attempt to avoid stale URLs.
-                        # Prefer MQTT if available, fall back to HTTP
+                        # One upload contract over MQTT or HTTP; only local
+                        # multipart uploads use the authenticated API client.
+                        upload = None
                         if self._mqtt_client and self._mqtt_client.connected:
                             try:
-                                signed_url_response = (
-                                    await self._mqtt_client.request_signed_url_for_attachment(
-                                        workload_uuid=workload.workload_uuid,
-                                        filename=filename,
-                                    )
+                                reply = await self._mqtt_client.request_signed_url_for_attachment(
+                                    workload_uuid=workload.workload_uuid, filename=filename,
                                 )
-                                signed_url = signed_url_response.payload.get("signed_url")
-                                # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
-                                response_filename = signed_url_response.payload.get("filename", "")
-                                attachment_uuid = (
-                                    os.path.splitext(response_filename)[0]
-                                    if response_filename
-                                    else None
-                                )
+                                upload = reply.payload
                             except (MQTTError, asyncio.TimeoutError) as e:
-                                logger.warning(
-                                    f"MQTT signed URL request failed for {filename}: {e}. "
-                                    "Falling back to HTTP."
-                                )
-                                # Fall back to HTTP
-                                signed_url_response = self.client.get_signed_url_for_attachment(
-                                    workload_uuid=workload.workload_uuid,
-                                    filename=filename,
-                                )
-                                signed_url = signed_url_response.get("signed_url")
-                                # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
-                                response_filename = signed_url_response.get("filename", "")
-                                attachment_uuid = (
-                                    os.path.splitext(response_filename)[0]
-                                    if response_filename
-                                    else None
-                                )
+                                logger.warning("Upload reservation over MQTT failed: %s", e)
+                        if upload is None:
+                            upload = await asyncio.to_thread(
+                                self.client.get_signed_url_for_attachment,
+                                workload_uuid=workload.workload_uuid, filename=filename,
+                            )
+                        signed_url = upload.get("signed_url", "")
+                        attachment_uuid = os.path.splitext(upload.get("filename", ""))[0]
+                        if not attachment_uuid:
+                            raise CloudNodeClientError(f"No attachment identity returned for {filename}")
+                        method = upload.get("upload_method", "signed_url")
+                        if method == "multipart":
+                            await asyncio.to_thread(
+                                self.client.upload_workload_attachment,
+                                workload.workload_uuid, attachment_uuid, file_path,
+                                upload_timeout_seconds,
+                            )
+                            status_code = 200
+                        elif method == "signed_url" and signed_url:
+                            response = await client.put(
+                                signed_url,
+                                content=self._file_chunk_stream(file_path),
+                                headers={
+                                    "Content-Type": "application/octet-stream",
+                                    "Content-Length": str(file_size),
+                                },
+                                timeout=upload_timeout_seconds,
+                            )
+                            status_code = response.status_code
                         else:
-                            # Use HTTP client
-                            signed_url_response = self.client.get_signed_url_for_attachment(
-                                workload_uuid=workload.workload_uuid,
-                                filename=filename,
-                            )
-                            signed_url = signed_url_response.get("signed_url")
-                            # Extract attachment UUID from filename (filename is "{attachment_uuid}{extension}")
-                            response_filename = signed_url_response.get("filename", "")
-                            attachment_uuid = (
-                                os.path.splitext(response_filename)[0]
-                                if response_filename
-                                else None
-                            )
+                            raise CloudNodeClientError(f"Unsupported upload method for {filename}")
 
-                        if not signed_url:
-                            raise CloudNodeClientError(f"No signed URL returned for {filename}")
-
-                        response = await client.put(
-                            signed_url,
-                            content=self._file_chunk_stream(file_path),
-                            headers={
-                                "Content-Type": "application/octet-stream",
-                                "Content-Length": str(file_size),
-                            },
-                            timeout=upload_timeout_seconds,
-                        )
-
-                        if response.status_code in (200, 204):
+                        if status_code in (200, 204):
                             logger.info(
                                 f"Uploaded: {filename} ({file_size} bytes, attempt {attempt})"
                             )
                             uploaded_count += 1
                             file_uploaded = True
                             # Track successful upload for result notification and deletion
-                            if attachment_uuid and signed_url:
+                            if attachment_uuid:
                                 uploaded_files.append(
                                     {
                                         "filename": filename,
@@ -2488,10 +2483,10 @@ class CloudNode:
                             break
 
                         retriable_status_codes = {408, 409, 425, 429, 500, 502, 503, 504}
-                        is_retriable = response.status_code in retriable_status_codes
+                        is_retriable = status_code in retriable_status_codes
                         if not is_retriable:
                             logger.error(
-                                f"Upload failed ({response.status_code}) and is not retriable: "
+                                f"Upload failed ({status_code}) and is not retriable: "
                                 f"{filename}"
                             )
                             break
@@ -2499,14 +2494,14 @@ class CloudNode:
                         if attempt < max_attempts:
                             retry_delay = base_retry_delay_seconds * (2 ** (attempt - 1))
                             logger.warning(
-                                f"Upload failed ({response.status_code}) for {filename}; "
+                                f"Upload failed ({status_code}) for {filename}; "
                                 f"retrying in {retry_delay:.1f}s (attempt {attempt}/{max_attempts})"
                             )
                             await asyncio.sleep(retry_delay)
                         else:
                             logger.error(
                                 f"Upload failed after {max_attempts} attempts "
-                                f"({response.status_code}): {filename}"
+                                f"({status_code}): {filename}"
                             )
 
                     except (CloudNodeClientError, httpx.TimeoutException, httpx.RequestError) as e:
@@ -2596,6 +2591,9 @@ class CloudNode:
                     f"Failed to notify backend about upload results: {e}. "
                     "Results uploaded but backend not notified. Files will not be deleted."
                 )
+
+        if uploaded_files and not backend_notified:
+            failed_count += len(uploaded_files)
 
         # Step 3f: Delete successfully uploaded files after backend notification
         if backend_notified and successfully_uploaded_paths:

@@ -910,7 +910,7 @@ class CloudNodeMQTTClient:
 
         # Check for signed_url in payload (backend may not include success field)
         signed_url = response.payload.get("signed_url")
-        if not signed_url:
+        if not signed_url and response.payload.get("upload_method") != "multipart":
             # If no signed_url, check for error
             if not response.success:
                 error_msg = response.payload.get("message", "Unknown error")

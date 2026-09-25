@@ -939,3 +939,52 @@ class ConsoleMirrorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResultPersistenceTests(unittest.TestCase):
+    _node_with_workload = FinalizingWorkloadBusyStateTests._node_with_workload
+
+    def test_failed_upload_marks_workload_failed_and_retains_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            node, workload = self._node_with_workload(tmp_dir)
+            node._buffer_log = AsyncMock()
+            node._flush_logs = AsyncMock()
+            node._upload_result_files = AsyncMock(return_value={"files_found": True, "uploaded_count": 0, "failed_count": 1})
+            workload.stdout_file.write_text("300 training steps completed")
+            workload.stderr_file.write_text("")
+            asyncio.run(node._handle_workload_completion(workload, exit_code=0))
+            completion = node._mqtt_client.complete_workload.await_args.kwargs
+            self.assertFalse(completion["success"])
+            self.assertIn("could not be saved", completion["error"])
+            self.assertTrue(workload.stdout_file.exists())
+
+    def test_multipart_upload_uses_authenticated_client_and_notifies_before_deleting(self):
+        for notification_ok in (True, False):
+            with self.subTest(notification_ok=notification_ok), tempfile.TemporaryDirectory() as tmp_dir:
+                node, workload = self._node_with_workload(tmp_dir)
+                node._mqtt_client = None
+                node.config.results_folder = "results"
+                results = Path(tmp_dir) / node.config.results_folder
+                results.mkdir(parents=True)
+                # A retained artifact from an earlier failed run stays private
+                # to that run, even after a later training succeeds.
+                stale_artifact = results / "previous-checkpoint.tar.gz"
+                stale_artifact.write_bytes(b"old checkpoint")
+                results = results / "current-workload"
+                results.mkdir()
+                workload.workload_type = "training"
+                workload.params["results_folder"] = str(results)
+                artifact = results / "checkpoint.tar.gz"
+                artifact.write_bytes(b"checkpoint")
+                node.client.get_signed_url_for_attachment.return_value = {"filename": "artifact-id.gz", "signed_url": "", "upload_method": "multipart"}
+                if not notification_ok:
+                    node.client.upload_workload_results.side_effect = RuntimeError("backend unavailable")
+                async_client = AsyncMock()
+                with patch("cyberwave_cloud_node.cloud_node.httpx.AsyncClient", return_value=async_client):
+                    result = asyncio.run(node._upload_result_files(workload))
+                node.client.upload_workload_attachment.assert_called_once()
+                async_client.__aenter__.return_value.put.assert_not_awaited()
+                self.assertEqual(result["failed_count"], 0 if notification_ok else 1)
+                self.assertEqual(artifact.exists(), not notification_ok)
+                self.assertTrue(stale_artifact.exists())
+                self.assertEqual(node.client.get_signed_url_for_attachment.call_args.kwargs["filename"], "checkpoint.tar.gz")
