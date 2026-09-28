@@ -36,6 +36,7 @@ from .client import CloudNodeClient, CloudNodeClientError
 from .config import (
     HEARTBEAT_AUTH_RETRY_BASE_SECONDS,
     HEARTBEAT_AUTH_RETRY_MAX_SECONDS,
+    INSTANCE_UUID_ENV,
     MAX_HEARTBEAT_AUTH_RETRIES,
     CloudNodeConfig,
     clean_subprocess_env,
@@ -43,11 +44,13 @@ from .config import (
     get_environment,
     get_instance_slug,
     get_instance_uuid,
+    get_preassigned_instance_uuid,
 )
 from .mqtt import (
     CloudNodeAuthError,
     CloudNodeInstanceGoneError,
     CloudNodeMQTTClient,
+    CloudNodeRegistrationRejectedError,
     MQTTError,
 )
 
@@ -224,6 +227,13 @@ class CloudNode:
         # Instance UUID can come from environment (e.g., set by Terraform) or will be
         # assigned by the backend during registration. Check environment first.
         self.instance_uuid: str = get_instance_uuid() or ""
+        # Set when the launcher started this node for one existing instance; such
+        # a node exits rather than ever registering a replacement.
+        self._preassigned_instance_uuid: str = get_preassigned_instance_uuid() or ""
+        # Raised by run_async so a background-loop shutdown exits non-zero.
+        self._fatal_error: Optional[str] = None
+        # The backend reported this instance gone; nothing left to notify.
+        self._instance_gone = False
         self._generated_mqtt_username = f"cloud-node-bootstrap-{uuid.uuid4().hex[:8]}"
 
         self._running = False
@@ -414,6 +424,8 @@ class CloudNode:
 
             # Wait for shutdown signal
             await self._shutdown_event.wait()
+            if self._fatal_error:
+                raise CloudNodeError(self._fatal_error)
 
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down gracefully")
@@ -2639,6 +2651,10 @@ class CloudNode:
 
         Retries registration every 10 seconds if it fails.
 
+        A pre-assigned UUID is never replaced: 403/404 raise
+        :class:`CloudNodeError` at once, 401 is retried with bounded backoff
+        first, and a response naming another UUID is refused.
+
         The backend owns the UUID and slug - after successful registration,
         this method updates self.instance_uuid and self.slug with the values
         returned by the backend.
@@ -2651,10 +2667,21 @@ class CloudNode:
         if not self._mqtt_client:
             raise CloudNodeError("MQTT client not connected")
 
+        preassigned = self._preassigned_instance_uuid
+        auth_rejections = 0
+
         while self._running:
             try:
                 instance_uuid = self.instance_uuid
                 instance_slug = self.slug
+
+                if preassigned and instance_uuid != preassigned:
+                    # Unreachable unless something swapped the UUID; step 1 would
+                    # otherwise create a second instance.
+                    raise CloudNodeError(
+                        f"Refusing to register instance {instance_uuid!r}: this node "
+                        f"was started for pre-assigned instance {preassigned}."
+                    )
 
                 # Step 1: Request instance creation (only if UUID not already set)
                 if not instance_uuid:
@@ -2695,8 +2722,15 @@ class CloudNode:
                     timeout=30.0,
                 )
 
+                registered_uuid = register_response.payload.get("uuid", instance_uuid)
+                if preassigned and registered_uuid != preassigned:
+                    raise CloudNodeError(
+                        f"Backend registered instance {registered_uuid!r}, not the "
+                        f"pre-assigned instance {preassigned}; refusing to serve it."
+                    )
+
                 # Update instance details
-                self.instance_uuid = register_response.payload.get("uuid", instance_uuid)
+                self.instance_uuid = registered_uuid
                 self.slug = register_response.payload.get("slug", instance_slug) or ""
 
                 if not self.instance_uuid:
@@ -2712,6 +2746,50 @@ class CloudNode:
                 logger.info("Registration successful via MQTT")
                 logger.info(f"Instance UUID: {self.instance_uuid}, Slug: {self.slug}")
                 return
+
+            except CloudNodeRegistrationRejectedError as e:
+                if not preassigned:
+                    logger.warning(f"Registration failed: {e}. Retrying in 10 seconds...")
+                    await asyncio.sleep(10)
+                    continue
+                if e.code == 401:
+                    auth_rejections += 1
+                    if auth_rejections < MAX_HEARTBEAT_AUTH_RETRIES:
+                        backoff = min(
+                            HEARTBEAT_AUTH_RETRY_BASE_SECONDS
+                            * (2 ** (auth_rejections - 1)),
+                            HEARTBEAT_AUTH_RETRY_MAX_SECONDS,
+                        )
+                        logger.warning(
+                            "Registration of pre-assigned instance %s: token rejected "
+                            "(attempt %d/%d): %s. Retrying in %.1fs in case the token "
+                            "is still propagating.",
+                            preassigned,
+                            auth_rejections,
+                            MAX_HEARTBEAT_AUTH_RETRIES,
+                            e,
+                            backoff,
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
+                hint = (
+                    "check that the instance exists and that CYBERWAVE_API_KEY "
+                    "belongs to a member of its workspace"
+                )
+                if self.config.reserved_environment_uuid:
+                    # The backend validates the reservation before the instance's
+                    # state, so a 403/404 may be about the environment instead.
+                    hint += (
+                        ", and that the reserved environment "
+                        f"{self.config.reserved_environment_uuid} "
+                        "(CYBERWAVE_NODE_ENVIRONMENT_UUID) exists and is readable "
+                        "by that key"
+                    )
+                raise CloudNodeError(
+                    f"Backend refused pre-assigned instance {preassigned} ({e}). "
+                    f"This node was started for that one instance "
+                    f"({INSTANCE_UUID_ENV}) and will not create another; {hint}."
+                ) from e
 
             except (MQTTError, asyncio.TimeoutError) as e:
                 logger.warning(f"Registration failed: {e}. Retrying in 10 seconds...")
@@ -2731,6 +2809,11 @@ class CloudNode:
         a dead UUID forever and never accept work again.
         """
         old_uuid = self.instance_uuid
+        if self._preassigned_instance_uuid:
+            raise CloudNodeError(
+                f"Instance {old_uuid} is gone on the backend and was pre-assigned "
+                f"({INSTANCE_UUID_ENV}); not creating a replacement."
+            )
         logger.warning("Instance %s is gone on the backend; re-registering.", old_uuid)
 
         if old_uuid and self._mqtt_client:
@@ -2840,6 +2923,18 @@ class CloudNode:
                 return
 
             except CloudNodeInstanceGoneError as e:
+                if self._preassigned_instance_uuid:
+                    # The launcher owns this instance; exit non-zero via run_async.
+                    self._fatal_error = (
+                        f"{e} This node was started for pre-assigned instance "
+                        f"{self._preassigned_instance_uuid} ({INSTANCE_UUID_ENV}) "
+                        "and will not register a replacement; shutting down."
+                    )
+                    logger.error(self._fatal_error)
+                    self._instance_gone = True
+                    self._running = False
+                    self._shutdown_event.set()
+                    return
                 logger.warning(
                     f"{e} Re-registering a fresh instance so the node can accept work again."
                 )
@@ -3224,6 +3319,9 @@ class CloudNode:
 
     async def _notify_failed(self, error: str) -> None:
         """Notify the backend that this node has failed via MQTT."""
+        if self._instance_gone:
+            logger.info("Instance is gone on the backend; not reporting it failed")
+            return
         try:
             if self._mqtt_client:
                 await self._mqtt_client.notify_failed(
@@ -3296,7 +3394,9 @@ class CloudNode:
 
         # Step 4: Notify backend of termination via MQTT
         try:
-            if self._mqtt_client and self.instance_uuid:
+            if self._instance_gone:
+                logger.info("Instance is gone on the backend; not reporting termination")
+            elif self._mqtt_client and self.instance_uuid:
                 await self._mqtt_client.notify_terminated(
                     instance_uuid=self.instance_uuid,
                     timeout=10.0,

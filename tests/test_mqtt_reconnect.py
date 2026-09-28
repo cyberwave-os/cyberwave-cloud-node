@@ -924,12 +924,18 @@ class MQTTReconnectTests(unittest.TestCase):
 
         client.publish_request = AsyncMock(return_value=SimpleNamespace(success=True, payload={}))
 
-        asyncio.run(client.complete_workload("workload-123", success=False, exit_code=1))
+        with self.assertLogs("cyberwave_cloud_node.mqtt", level="INFO") as captured:
+            asyncio.run(client.complete_workload("workload-123", success=False, exit_code=1))
 
         client.publish_request.assert_awaited_once_with(
             "localcyberwave/cloud-workload/workload-123/update-status",
             {"status": "completed", "success": False, "exit_code": 1},
             timeout=30.0,
+        )
+        logged = "\n".join(captured.output)
+        self.assertNotIn("completed successfully", logged)
+        self.assertIn(
+            "WARNING:cyberwave_cloud_node.mqtt:Workload workload-123 completed as FAILED", logged
         )
 
     def test_matches_response_correlation_data_when_bytearray(self) -> None:

@@ -5,6 +5,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from uuid import UUID
 
 import yaml
 from dotenv import load_dotenv
@@ -135,6 +136,28 @@ def get_reserved_environment_uuid() -> Optional[str]:
     return value or None
 
 
+#: Set by the launcher (Terraform, a compose file) to pin one existing instance.
+INSTANCE_UUID_ENV = "CYBERWAVE_CLOUD_NODE_INSTANCE_UUID"
+
+
+def get_preassigned_instance_uuid() -> Optional[str]:
+    """The instance UUID pinned via the environment, if any.
+
+    Unlike :func:`get_instance_uuid` this ignores the stored identity file, which
+    may be replaced; a pinned UUID never is.
+
+    Canonicalised (lowercase, hyphenated) to match the UUID the backend echoes
+    back; a value that is not a UUID is passed through for the backend to reject.
+    """
+    value = (os.getenv(INSTANCE_UUID_ENV) or "").strip()
+    if not value:
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return value
+
+
 def get_instance_uuid() -> Optional[str]:
     """Get the instance UUID from environment or stored identity.
 
@@ -142,7 +165,7 @@ def get_instance_uuid() -> Optional[str]:
     1. CYBERWAVE_CLOUD_NODE_INSTANCE_UUID environment variable
     2. Stored identity in the Cyberwave config directory (instance_identity.json)
     """
-    uuid = os.getenv("CYBERWAVE_CLOUD_NODE_INSTANCE_UUID")
+    uuid = get_preassigned_instance_uuid()
     if uuid:
         return uuid
 

@@ -37,7 +37,11 @@ from .client import (
     TerminatedResponse,
 )
 from .cloud_node import CloudNode, CloudNodeError, WorkloadResult
-from .mqtt import CloudNodeAuthError
+from .mqtt import (
+    CloudNodeAuthError,
+    CloudNodeInstanceGoneError,
+    CloudNodeRegistrationRejectedError,
+)
 from .config import CloudNodeConfig, load_dotenv_files
 from .credentials import (
     Credentials,
@@ -71,5 +75,7 @@ __all__ = [
     # Exceptions
     "CloudNodeError",
     "CloudNodeAuthError",
+    "CloudNodeRegistrationRejectedError",
+    "CloudNodeInstanceGoneError",
     "CloudNodeClientError",
 ]

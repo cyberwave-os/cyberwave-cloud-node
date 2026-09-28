@@ -70,6 +70,22 @@ class CloudNodeInstanceGoneError(MQTTError):
     pass
 
 
+class CloudNodeRegistrationRejectedError(MQTTError):
+    """Raised when the backend definitively refuses to register an instance UUID.
+
+    ``code`` is 401 (token rejected), 403 (not a member of the instance's
+    workspace / reserved environment) or 404 (no such instance / environment).
+    Other failures stay plain :class:`MQTTError`; subclassing it keeps existing
+    retry behaviour for callers that do not distinguish.
+    """
+
+    CODES = frozenset({401, 403, 404})
+
+    def __init__(self, message: str, *, code: int):
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass
 class MQTTResponse:
     """Response from an MQTT request/response operation."""
@@ -593,7 +609,9 @@ class CloudNodeMQTTClient:
             MQTTResponse with instance details (uuid, slug, status)
 
         Raises:
-            MQTTError: If request fails
+            CloudNodeRegistrationRejectedError: If the backend answers 401, 403
+                or 404 -- the UUID will not register for this token
+            MQTTError: If request fails for any other reason
             asyncio.TimeoutError: If no response within timeout
         """
         # Build request payload
@@ -612,6 +630,12 @@ class CloudNodeMQTTClient:
 
         if not response.success:
             error_msg = response.payload.get("message", "Unknown error")
+            code = response.payload.get("code")
+            if code in CloudNodeRegistrationRejectedError.CODES:
+                raise CloudNodeRegistrationRejectedError(
+                    f"Instance registration rejected (code={code}): {error_msg}",
+                    code=code,
+                )
             raise MQTTError(f"Instance registration failed: {error_msg}")
 
         logger.info(
@@ -872,7 +896,13 @@ class CloudNodeMQTTClient:
             error_msg = response.payload.get("message", "Unknown error")
             raise MQTTError(f"Workload completion failed: {error_msg}")
 
-        logger.info(f"Workload {workload_uuid} completed successfully")
+        if success:
+            logger.info(f"Workload {workload_uuid} completed successfully")
+        else:
+            logger.warning(
+                f"Workload {workload_uuid} completed as FAILED (exit code {exit_code}): "
+                f"{error or 'no error summary'}"
+            )
         return response
 
     async def request_signed_url_for_attachment(
