@@ -649,12 +649,16 @@ class CloudNodeMQTTClient:
         self,
         instance_uuid: str,
         timeout: float = 10.0,
+        busy: Optional[bool] = None,
     ) -> MQTTResponse:
         """Send heartbeat via MQTT.
 
         Args:
             instance_uuid: UUID of the cloud node instance
             timeout: Timeout in seconds
+            busy: Whether a workload still occupies the node. The backend keeps
+                the instance BUSY while this is True, so a stopped workload's
+                teardown is not mistaken for a free host.
 
         Returns:
             MQTTResponse with heartbeat confirmation
@@ -667,7 +671,8 @@ class CloudNodeMQTTClient:
 
         logger.debug(f"Sending heartbeat for instance {instance_uuid}")
 
-        response = await self.publish_request(topic, {}, timeout=timeout)
+        payload: dict[str, Any] = {} if busy is None else {"busy": busy}
+        response = await self.publish_request(topic, payload, timeout=timeout)
 
         if not response.success:
             error_msg = response.payload.get("message", "Unknown error")

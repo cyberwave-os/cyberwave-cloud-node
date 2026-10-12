@@ -446,6 +446,22 @@ class MQTTReconnectTests(unittest.TestCase):
         with self.assertRaises(CloudNodeInstanceGoneError):
             asyncio.run(client.send_heartbeat("abc"))
 
+    def test_send_heartbeat_reports_busy_only_when_given(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
+            client = CloudNodeMQTTClient(host="mqtt.example.com", port=1883)
+
+        client.publish_request = AsyncMock(
+            return_value=SimpleNamespace(success=True, payload={"message": "ok"})
+        )
+
+        asyncio.run(client.send_heartbeat("abc", busy=True))
+        asyncio.run(client.send_heartbeat("abc"))
+
+        payloads = [call.args[1] for call in client.publish_request.await_args_list]
+        self.assertEqual(payloads, [{"busy": True}, {}])
+
     def test_send_heartbeat_raises_instance_gone_when_terminated(self) -> None:
         mock_paho_client = Mock()
 
@@ -496,6 +512,53 @@ class MQTTReconnectTests(unittest.TestCase):
             asyncio.run(node._heartbeat_loop())
 
         self.assertEqual(reregistered["count"], 1)
+
+    def test_heartbeat_reports_busy_until_a_stopped_workload_is_gone(self) -> None:
+        """The backend frees a stopped sim's host only on an idle heartbeat.
+
+        The plant takes ~30 s to tear down after SIGTERM; reporting busy for
+        that window keeps the backend from dispatching the restart into a busy
+        rejection, and going idle wakes the heartbeat so the host frees at once.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch(
+                "cyberwave_cloud_node.cloud_node.Path.home",
+                return_value=Path(tmp_dir),
+            ):
+                node = CloudNode(
+                    config=CloudNodeConfig(heartbeat_interval=3600),
+                    client=Mock(),
+                    working_dir=Path(tmp_dir),
+                )
+
+            node._running = True
+            node.instance_uuid = "inst-1"
+            node._mqtt_client = AsyncMock()
+            workload = SimpleNamespace(pid=4242)
+            node._finalizing_workloads[workload.pid] = workload  # type: ignore[assignment]
+            sent: list[object] = []
+
+            async def heartbeat(*_args: object, **kwargs: object) -> object:
+                sent.append(kwargs.get("busy"))
+                if len(sent) == 2:
+                    node._running = False
+                    node._heartbeat_wake.set()  # skip the trailing interval
+                return SimpleNamespace(payload={"message": "ok"})
+
+            node._mqtt_client.send_heartbeat = AsyncMock(side_effect=heartbeat)
+
+            async def scenario() -> None:
+                loop_task = asyncio.create_task(node._heartbeat_loop())
+                while not sent:
+                    await asyncio.sleep(0)
+                # Teardown done: releasing the last workload must not wait out
+                # the hour-long interval before telling the backend.
+                await node._release_finalizing_workload(workload)  # type: ignore[arg-type]
+                await asyncio.wait_for(loop_task, timeout=5)
+
+            asyncio.run(scenario())
+
+        self.assertEqual(sent, [True, False])
 
     def test_heartbeat_loop_recovers_from_transient_auth_failure(self) -> None:
         """A single 401 followed by success must NOT shut the node down."""

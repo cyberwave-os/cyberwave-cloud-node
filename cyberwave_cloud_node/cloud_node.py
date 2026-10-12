@@ -243,6 +243,10 @@ class CloudNode:
         self._workload_monitor_task: Optional[asyncio.Task] = None
         self._workload_log_stream_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
+        # Set when the node goes idle so the heartbeat reports it at once: the
+        # backend releases a stopped workload's host only on a heartbeat that
+        # says the node is no longer busy.
+        self._heartbeat_wake = asyncio.Event()
 
         # Track active workloads by PID (process-based, survives restarts)
         self._active_workloads: Dict[int, ActiveWorkload] = {}
@@ -2036,6 +2040,8 @@ class CloudNode:
         """Stop counting a workload as occupying the node once completion ends."""
         async with self._workload_lock:
             self._finalizing_workloads.pop(workload.pid, None)
+            if not self._is_node_busy():
+                self._heartbeat_wake.set()
 
     async def _file_chunk_stream(
         self, file_path: Path, chunk_size: int = 1024 * 1024
@@ -2830,6 +2836,16 @@ class CloudNode:
             old_uuid,
         )
 
+    async def _wait_for_next_heartbeat(self) -> None:
+        """Sleep one heartbeat interval, or less if the node just went idle."""
+        try:
+            await asyncio.wait_for(
+                self._heartbeat_wake.wait(), timeout=self.config.heartbeat_interval
+            )
+        except asyncio.TimeoutError:
+            pass
+        self._heartbeat_wake.clear()
+
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to the backend via MQTT."""
         logger.info(f"Starting heartbeat loop (interval: {self.config.heartbeat_interval}s)")
@@ -2876,6 +2892,7 @@ class CloudNode:
                     response = await self._mqtt_client.send_heartbeat(
                         instance_uuid=self.instance_uuid,
                         timeout=10.0,
+                        busy=self._is_node_busy(),
                     )
                     logger.debug(f"Heartbeat sent via MQTT: {response.payload.get('message')}")
                     # A successful heartbeat clears both failure counters.
@@ -2968,7 +2985,7 @@ class CloudNode:
                 else:
                     logger.warning(f"Heartbeat failed: {e}")
 
-            await asyncio.sleep(self.config.heartbeat_interval)
+            await self._wait_for_next_heartbeat()
 
     def _read_new_log_bytes(self, path: Path, offset: int) -> tuple[str, int]:
         """Read newly-appended text from ``path`` starting at byte ``offset``.
