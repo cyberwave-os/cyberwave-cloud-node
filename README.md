@@ -41,6 +41,7 @@ cyberwave-cloud-node:
   inference: python ./inference.py --params {body}  # {body} renders to JSON params from MQTT
   simulate: python ./simulate.py --params {body}
   training: python ./training.py --params {body}
+  cleanup: python ./simulate.py --cleanup   # optional: stop what finished workloads left running
   profile_slug: gpu-a100                # optional: node profile (default: "default")
   heartbeat_interval: 30                # optional: heartbeat interval in seconds
   mqtt_host: mqtt.cyberwave.com         # optional: custom MQTT broker
@@ -366,12 +367,26 @@ Training and inference jobs run as **independent OS processes** that survive Clo
    - The node also serialises its own start handling, so two start requests that
      arrive at the same moment can never both land on it
 
-6. **Workload Cancellation**:
+6. **Cleanup After Workloads That Are Gone**:
+   - A workload whose process dies without tearing down (a recreated node
+     container, a stale workload the node kills) can leave containers or a
+     remote simulation running
+   - Every workload gets `CYBERWAVE_CLOUD_NODE_ID` (persisted as `cloud_node_id`
+     in the state directory) and `CYBERWAVE_WORKLOAD_UUID`. Runners label the
+     containers they start with them through edge-core
+     (`container_spec.workload_labels`)
+   - The optional `cleanup` command in `cyberwave.yml` runs at startup, after
+     reattaching, and before each spawn. It gets `CYBERWAVE_CLOUD_NODE_ID` and
+     `CYBERWAVE_LIVE_WORKLOAD_UUIDS` and stops what the other workloads left
+     running (`run_sim_workload.py --cleanup` for MuJoCo). A failure is logged,
+     never fatal
+
+7. **Workload Cancellation**:
    - Backend can cancel workloads by PID or request_id
    - Supports graceful (SIGTERM) or force (SIGKILL) termination
    - Sends cancellation notification to original workload request
 
-7. **Graceful Shutdown**: When Cloud Node shuts down (Ctrl+C, SIGTERM, SIGINT):
+8. **Graceful Shutdown**: When Cloud Node shuts down (Ctrl+C, SIGTERM, SIGINT):
    - ✅ Stops accepting new commands
    - ✅ Cancels background monitoring tasks
    - ✅ Logs running workload PIDs and output file locations

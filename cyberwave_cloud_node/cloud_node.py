@@ -15,6 +15,7 @@ and collect results when workloads complete.
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -52,6 +53,13 @@ from .mqtt import (
     CloudNodeMQTTClient,
     CloudNodeRegistrationRejectedError,
     MQTTError,
+)
+from .workload_cleanup import (
+    CLEANUP_TIMEOUT_S,
+    CLOUD_NODE_ID_ENV,
+    WORKLOAD_UUID_ENV,
+    cleanup_env,
+    load_cloud_node_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -248,6 +256,8 @@ class CloudNode:
         # says the node is no longer busy.
         self._heartbeat_wake = asyncio.Event()
 
+        # Stable across restarts; see workload_cleanup. Loaded lazily.
+        self._cloud_node_id: Optional[str] = None
         # Track active workloads by PID (process-based, survives restarts)
         self._active_workloads: Dict[int, ActiveWorkload] = {}
         # Workloads whose process has exited but whose completion is still
@@ -953,6 +963,7 @@ class CloudNode:
                 return
 
             logger.info(f"Starting {workload_type} workload (request_id: {request_id})")
+            await self._run_workload_cleanup()
             await self._spawn_workload_process(workload_type, params, request_id)
 
     async def _handle_inference(self, params: dict, request_id: Optional[str]) -> None:
@@ -1507,6 +1518,13 @@ class CloudNode:
                 else:
                     logger.debug("Passing service CYBERWAVE_API_KEY to subprocess")
 
+            # Lets the workload label the containers it starts; see workload_cleanup.
+            subprocess_env[CLOUD_NODE_ID_ENV] = self.cloud_node_id
+            if params.get("workload_uuid"):
+                subprocess_env[WORKLOAD_UUID_ENV] = str(params["workload_uuid"])
+            else:
+                subprocess_env.pop(WORKLOAD_UUID_ENV, None)
+
             with stdout_file.open("w") as stdout_f, stderr_file.open("w") as stderr_f:
                 process = subprocess.Popen(
                     shell_command,
@@ -1755,7 +1773,56 @@ class CloudNode:
             logger.error(f"Failed to save workload state: {e}")
             raise
 
+    @property
+    def cloud_node_id(self) -> str:
+        """This node's id, stable across restarts; see workload_cleanup."""
+        if self._cloud_node_id is None:
+            self._cloud_node_id = load_cloud_node_id(_cloud_node_state_dir())
+        return self._cloud_node_id
+
     async def _recover_local_workloads(self):
+        """Reattach to surviving workload processes, then clean up after the rest."""
+        await self._reattach_local_workloads()
+        await self._run_workload_cleanup()
+
+    async def _run_workload_cleanup(self) -> None:
+        """Run the profile's ``cleanup`` command for workloads that are not live.
+
+        It stops what such workloads left running, e.g. containers they started.
+        Bounded by ``CLEANUP_TIMEOUT_S``; a failure is logged, never raised.
+        """
+        command = self.config.cleanup
+        if not command:
+            return
+        live = {str(w.workload_uuid) for w in self._active_workloads.values() if w.workload_uuid}
+        env = cleanup_env(clean_subprocess_env(), self.cloud_node_id, live)
+        process = None
+        try:
+            process = await asyncio.create_subprocess_shell(
+                f"bash -c {shlex.quote(command)}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+                cwd=self.working_dir,
+                start_new_session=True,
+            )
+            output, _ = await asyncio.wait_for(process.communicate(), CLEANUP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning("Workload cleanup did not finish in %.0fs", CLEANUP_TIMEOUT_S)
+            if process is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            return
+        except Exception as e:
+            logger.warning(f"Workload cleanup failed to run: {e}")
+            return
+        text = output.decode("utf-8", errors="replace").strip()
+        if process.returncode:
+            logger.warning("Workload cleanup exited with %s: %s", process.returncode, text)
+        elif text:
+            logger.info("Workload cleanup: %s", text)
+
+    async def _reattach_local_workloads(self):
         """Load workload state from local file and reattach to running processes."""
         state_file = _cloud_node_state_dir() / "active_workloads.json"
 

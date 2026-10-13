@@ -309,6 +309,9 @@ class CloudNodeConfig:
     inference: Optional[str] = None
     training: Optional[str] = None
     simulate: Optional[str] = None
+    # Stops what workloads that are no longer live left running (e.g. their
+    # containers); see workload_cleanup.
+    cleanup: Optional[str] = None
     profile_slug: str = "default"
     # Cyberwave environment UUID this node is reserved for (optional). When
     # set, the backend only schedules that environment's workloads here.
@@ -336,6 +339,7 @@ class CloudNodeConfig:
             inference=cloud_node_data.get("inference"),
             training=cloud_node_data.get("training"),
             simulate=cloud_node_data.get("simulate"),
+            cleanup=cloud_node_data.get("cleanup"),
             profile_slug=cloud_node_data.get("profile_slug", "default"),
             reserved_environment_uuid=cloud_node_data.get(
                 "environment_uuid", get_reserved_environment_uuid()
@@ -360,6 +364,7 @@ class CloudNodeConfig:
                     "inference",
                     "training",
                     "simulate",
+                    "cleanup",
                     "profile_slug",
                     "environment_uuid",
                     "heartbeat_interval",
