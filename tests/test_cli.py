@@ -172,7 +172,7 @@ class StartNodeTests(unittest.TestCase):
     @staticmethod
     def _config() -> SimpleNamespace:
         return SimpleNamespace(
-            profile_slug="cyberwave-sim",
+            profile_slug="mujoco-sim",
             reserved_environment_uuid=None,
             mqtt_host="localhost",
             mqtt_port=1883,
