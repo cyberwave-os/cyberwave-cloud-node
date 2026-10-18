@@ -8,6 +8,9 @@ stubs are installed into ``sys.modules``.
 
 import asyncio
 import os
+import shlex
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -884,6 +887,8 @@ class MQTTReconnectTests(unittest.TestCase):
             timeout=30.0,
             error=None,
             stderr=None,
+            cancelled=True,
+            cancel_signal="SIGTERM",
         )
 
     def test_failed_workload_completion_reports_failure_metadata(self) -> None:
@@ -925,6 +930,8 @@ class MQTTReconnectTests(unittest.TestCase):
             timeout=30.0,
             error="ImportError: pymeshlab failed to import",
             stderr="ImportError: pymeshlab failed to import",
+            cancelled=False,
+            cancel_signal=None,
         )
 
     def test_completion_is_deduplicated_after_cancel_handles_dead_process(self) -> None:
@@ -972,6 +979,8 @@ class MQTTReconnectTests(unittest.TestCase):
             timeout=30.0,
             error=None,
             stderr=None,
+            cancelled=True,
+            cancel_signal="SIGTERM",
         )
 
     def test_complete_workload_publishes_success_metadata(self) -> None:
@@ -1000,6 +1009,73 @@ class MQTTReconnectTests(unittest.TestCase):
         self.assertIn(
             "WARNING:cyberwave_cloud_node.mqtt:Workload workload-123 completed as FAILED", logged
         )
+
+    def test_complete_workload_publishes_cancel_marker(self) -> None:
+        mock_paho_client = Mock()
+
+        with patch("cyberwave_cloud_node.mqtt.mqtt.Client", return_value=mock_paho_client):
+            client = CloudNodeMQTTClient(
+                host="mqtt.example.com",
+                port=1883,
+                client_id="cloud_node_test",
+                topic_prefix="local",
+            )
+
+        client.publish_request = AsyncMock(return_value=SimpleNamespace(success=True, payload={}))
+
+        asyncio.run(
+            client.complete_workload(
+                "workload-123",
+                success=True,
+                exit_code=0,
+                cancelled=True,
+                cancel_signal="SIGTERM",
+            )
+        )
+
+        client.publish_request.assert_awaited_once_with(
+            "localcyberwave/cloud-workload/workload-123/update-status",
+            {
+                "status": "completed",
+                "success": True,
+                "exit_code": 0,
+                "cancelled": True,
+                "cancel_signal": "SIGTERM",
+            },
+            timeout=30.0,
+        )
+
+    def test_detached_workload_shell_tracks_the_workload_process(self) -> None:
+        """A process-group SIGTERM reaches the workload, not a bare ``sh``.
+
+        The workload handles SIGTERM and exits 0, as the Isaac runner does
+        after stopping its container. Without ``exec`` the tracked PID is the
+        outer ``sh``, which dies from the signal at once with -15.
+        """
+        script = (
+            "import signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        shell_command = CloudNode._detached_workload_shell_command(command)
+        self.assertTrue(shell_command.startswith("exec bash -c "))
+        process = subprocess.Popen(
+            shell_command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            assert process.stdout is not None
+            self.assertEqual(process.stdout.readline().strip(), b"ready")
+            os.killpg(process.pid, signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=10), 0)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
 
     def test_matches_response_correlation_data_when_bytearray(self) -> None:
         mock_paho_client = Mock()

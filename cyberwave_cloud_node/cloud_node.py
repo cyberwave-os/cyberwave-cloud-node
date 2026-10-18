@@ -839,6 +839,20 @@ class CloudNode:
         """Get count of workloads occupying the node (running + finalizing)."""
         return len(self._active_workloads) + len(self._finalizing_workloads)
 
+    @staticmethod
+    def _detached_workload_shell_command(command: str) -> str:
+        """Shell line for a detached workload whose PID the node tracks.
+
+        ``bash -c`` gives the command proper shell expansion. ``exec`` replaces
+        the outer ``/bin/sh -c`` that ``Popen(shell=True)`` adds, and bash
+        itself execs a single simple command, so the tracked PID is the
+        workload process. Without it the tracked PID is a bare ``sh`` that
+        dies from the cancel SIGTERM at once (exit -15) while the workload is
+        still shutting down, and the node reports completion -- and frees the
+        host -- before the workload has actually stopped.
+        """
+        return f"exec bash -c {shlex.quote(command)}"
+
     def _cancellation_counts_as_success(self, workload_type: str) -> bool:
         """Return whether a cancelled workload type should complete successfully."""
         return workload_type in self.CANCEL_COUNTS_AS_SUCCESS_WORKLOAD_TYPES
@@ -1477,8 +1491,7 @@ class CloudNode:
 
         try:
             # Spawn detached process
-            # Use bash -c to ensure proper shell expansion
-            shell_command = f"bash -c {shlex.quote(command)}"
+            shell_command = self._detached_workload_shell_command(command)
 
             # Prepare environment for subprocess
             # Inherit parent environment and explicitly pass Sentry config
@@ -2284,6 +2297,8 @@ class CloudNode:
                 "exit_code": exit_code,
                 "duration_seconds": duration,
             }
+            if cancellation_counts_as_success:
+                result_data["cancelled"] = True
             if failure_error:
                 result_data["error"] = failure_error
             if failure_stderr:
@@ -2355,6 +2370,10 @@ class CloudNode:
                         timeout=30.0,
                         error=failure_error,
                         stderr=failure_stderr,
+                        cancelled=cancellation_counts_as_success,
+                        cancel_signal=(
+                            workload.cancel_signal if cancellation_counts_as_success else None
+                        ),
                     )
                     completion_confirmed = True
                     logger.info(f"Workload {workload.workload_uuid} completion notified via MQTT")

@@ -858,6 +858,8 @@ class CloudNodeMQTTClient:
         timeout: float = 30.0,
         error: str | None = None,
         stderr: str | None = None,
+        cancelled: bool = False,
+        cancel_signal: str | None = None,
     ) -> MQTTResponse:
         """Mark workload as completed via MQTT.
 
@@ -868,6 +870,9 @@ class CloudNodeMQTTClient:
             timeout: Timeout in seconds
             error: Optional short, human-readable failure summary
             stderr: Optional bounded stderr tail for diagnostics
+            cancelled: The process exited because an operator cancel signalled
+                it; the backend records the run as cancelled, not completed
+            cancel_signal: The signal the cancel sent (e.g. ``SIGTERM``)
 
         Returns:
             MQTTResponse with completion confirmation
@@ -892,6 +897,10 @@ class CloudNodeMQTTClient:
             payload["error"] = error
         if stderr:
             payload["stderr"] = stderr
+        if cancelled:
+            payload["cancelled"] = True
+            if cancel_signal:
+                payload["cancel_signal"] = cancel_signal
 
         logger.info(f"Completing workload {workload_uuid} via MQTT")
 
