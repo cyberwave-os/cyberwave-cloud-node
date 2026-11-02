@@ -29,7 +29,7 @@ jobs:
           # Use python:3.10-slim-bullseye for GLIBC 2.31 compatibility
           # Bullseye has same GLIBC as Ubuntu 20.04
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             container: python:3.10-slim-bullseye
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -187,7 +187,7 @@ jobs:
 
   publish-to-buildkite:
     name: Publish to Buildkite Package Registries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build-deb]
     steps:
       - name: Download all .deb artifacts
@@ -247,7 +247,7 @@ jobs:
 
   create-github-release:
     name: Create GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build-deb]
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -271,7 +271,7 @@ jobs:
 
   notify-slack:
     name: Notify Slack
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [create-github-release]
     if: always()
     steps:
